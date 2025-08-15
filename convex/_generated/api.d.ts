@@ -15,6 +15,8 @@ import type {
 } from "convex/server";
 import type * as lib_apiHelpers from "../lib/apiHelpers.js";
 import type * as media_mediaQueries from "../media/mediaQueries.js";
+import type * as media_rawg from "../media/rawg.js";
+import type * as media_spotify from "../media/spotify.js";
 import type * as media_tmdb from "../media/tmdb.js";
 import type * as users from "../users.js";
 
@@ -29,6 +31,8 @@ import type * as users from "../users.js";
 declare const fullApi: ApiFromModules<{
   "lib/apiHelpers": typeof lib_apiHelpers;
   "media/mediaQueries": typeof media_mediaQueries;
+  "media/rawg": typeof media_rawg;
+  "media/spotify": typeof media_spotify;
   "media/tmdb": typeof media_tmdb;
   users: typeof users;
 }>;
