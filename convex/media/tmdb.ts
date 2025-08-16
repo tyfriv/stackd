@@ -10,7 +10,7 @@ const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
 if (!TMDB_API_KEY) {
-  console.error("TMDB_API_KEY is not set in environment variables");
+  throw new Error("TMDB_API_KEY is not set in environment variables");
 }
 
 // TMDB API rate limit: Much higher than RAWG, using 100 per hour to be safe

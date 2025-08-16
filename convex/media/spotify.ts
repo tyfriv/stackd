@@ -11,7 +11,7 @@ const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 const SPOTIFY_BASE_URL = "https://api.spotify.com/v1";
 
 if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
-  console.error("SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET is not set in environment variables");
+  throw new Error("SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET is not set in environment variables");
 }
 
 // In-memory token storage
