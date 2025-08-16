@@ -169,5 +169,6 @@ export default defineSchema({
     timestamp: v.number(),
   })
     .index("by_key", ["key"])
-    .index("by_timestamp", ["timestamp"]),
+    .index("by_timestamp", ["timestamp"])
+    .index("by_key_timestamp", ["key", "timestamp"]), // PERFORMANCE FIX: Compound index for rate limiting
 });

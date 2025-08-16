@@ -1,14 +1,9 @@
-import { v } from "convex/values";
+// convex/media/tmdb.ts
 import { action } from "../_generated/server";
-import { internal } from "../_generated/api";
-import { 
-  MediaSearchResult, 
-  APIError, 
-  handleAPIResponse, 
-  standardizePosterUrl, 
-  extractYear, 
-  cleanDescription
-} from "../lib/apiHelpers";
+import { v } from "convex/values";
+import { internal, api } from "../_generated/api";
+import { APIError, extractYear, cleanDescription, standardizePosterUrl } from "../lib/apiHelpers";
+import type { MediaSearchResult } from "../lib/apiHelpers";
 
 // TMDB API configuration
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
@@ -18,389 +13,593 @@ if (!TMDB_API_KEY) {
   console.error("TMDB_API_KEY is not set in environment variables");
 }
 
-// TMDB API response types (minimal - only what we need)
-interface TMDBMovieResult {
+// TMDB API rate limit: Much higher than RAWG, using 100 per hour to be safe
+async function checkTMDBRateLimit(ctx: any): Promise<void> {
+  const identity = await ctx.auth.getUserIdentity();
+  const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
+  
+  const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+    key: userRateLimitKey,
+    limit: 100, // 100 requests per hour per user
+    windowMs: 60 * 60 * 1000 // 1 hour
+  });
+
+  if (!rateLimitAllowed) {
+    throw new APIError("TMDB API rate limit exceeded", "tmdb", 429);
+  }
+}
+
+interface TMDBMovie {
   id: number;
   title: string;
   release_date: string;
   poster_path: string | null;
   overview: string;
+  vote_average: number;
+  genre_ids: number[];
 }
 
-interface TMDBTVResult {
+interface TMDBTVShow {
   id: number;
   name: string;
   first_air_date: string;
   poster_path: string | null;
   overview: string;
+  vote_average: number;
+  genre_ids: number[];
 }
 
 interface TMDBSearchResponse {
-  results: (TMDBMovieResult | TMDBTVResult)[];
+  results: (TMDBMovie | TMDBTVShow)[];
   total_results: number;
-  page: number;
   total_pages: number;
+  page: number;
 }
 
-// Helper function to make secure API calls
-async function makeSecureTMDBRequest(endpoint: string, params: Record<string, string> = {}): Promise<Response> {
-  if (!TMDB_API_KEY) {
-    throw new APIError("TMDB API key not configured", "tmdb");
-  }
-
-  const url = new URL(endpoint, TMDB_BASE_URL);
-  Object.entries(params).forEach(([key, value]) => {
-    url.searchParams.append(key, value);
-  });
-
-  return await fetch(url.toString(), {
-    headers: {
-      'Authorization': `Bearer ${TMDB_API_KEY}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json'
-    },
-    method: 'GET'
-  });
+/**
+ * Transform TMDB movie data to standardized MediaSearchResult format
+ */
+function transformTMDBMovie(movie: TMDBMovie): MediaSearchResult {
+  const releaseYear = movie.release_date ? extractYear(movie.release_date) : new Date().getFullYear();
+  
+  return {
+    externalId: movie.id.toString(),
+    type: "movie" as const,
+    title: movie.title,
+    releaseYear: releaseYear,
+    posterUrl: standardizePosterUrl(movie.poster_path, 'tmdb'),
+    description: cleanDescription(movie.overview),
+    artist: undefined, // Movies don't have artists
+    season: undefined  // Movies don't have seasons
+  };
 }
 
-// Search movies via TMDB API
+/**
+ * Transform TMDB TV show data to standardized MediaSearchResult format
+ */
+function transformTMDBTVShow(show: TMDBTVShow): MediaSearchResult {
+  const releaseYear = show.first_air_date ? extractYear(show.first_air_date) : new Date().getFullYear();
+  
+  return {
+    externalId: show.id.toString(),
+    type: "tv" as const,
+    title: show.name,
+    releaseYear: releaseYear,
+    posterUrl: standardizePosterUrl(show.poster_path, 'tmdb'),
+    description: cleanDescription(show.overview),
+    artist: undefined, // TV shows don't have artists
+    season: 1  // Default to season 1 for TV shows
+  };
+}
+
+/**
+ * Search for movies using TMDB API
+ */
 export const searchMovies = action({
-  args: { query: v.string(), page: v.optional(v.number()) },
+  args: { 
+    query: v.string(),
+    page: v.optional(v.number())
+  },
   handler: async (ctx, args): Promise<MediaSearchResult[]> => {
-    if (!TMDB_API_KEY) {
+    const { query, page = 1 } = args;
+
+    // SECURITY FIX: Better input validation
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
+      return [];
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (trimmedQuery.length > 100) {
+      throw new Error("Search query too long");
+    }
+
+    // Rate limiting check
+    await checkTMDBRateLimit(ctx);
+
+    // Check cache first - search for movies with matching titles
+    const cachedResults = await ctx.runQuery(
+      api.media.mediaQueries.searchCachedMedia,
+      { query: trimmedQuery, type: "movie", limit: 20 }
+    );
+
+    // If we have enough cached results, return them
+    if (cachedResults.length >= Math.min(20, 10)) {
+      console.log(`🎬 TMDB: Returning ${cachedResults.length} cached movies for "${trimmedQuery}"`);
+      return cachedResults;
+    }
+
+    // Call TMDB API
+    const apiKey = process.env.TMDB_API_KEY;
+    if (!apiKey) {
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Get current user for rate limiting
-    const identity = await ctx.auth.getUserIdentity();
-    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
-
-    // Check rate limiting with database-backed implementation
-    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
-      key: userRateLimitKey,
-      limit: 30, // 30 requests per hour per user
-      windowMs: 60 * 60 * 1000 // 1 hour
-    });
-
-    if (!rateLimitAllowed) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
-    }
-
-    const page = args.page || 1;
-    
     try {
-      const response = await makeSecureTMDBRequest('/search/movie', {
-        query: encodeURIComponent(args.query.trim()),
-        page: page.toString()
+      const searchParams = new URLSearchParams({
+        api_key: apiKey,
+        query: trimmedQuery,
+        page: page.toString(),
+        language: 'en-US'
       });
 
-      const data: TMDBSearchResponse = await handleAPIResponse(response, "tmdb");
+      console.log(`🎬 TMDB: Searching movies for "${trimmedQuery}"`);
+      
+      const response = await fetch(
+        `${TMDB_BASE_URL}/search/movie?${searchParams.toString()}`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'STACKD/1.0'
+          }
+        }
+      );
 
-      const results: MediaSearchResult[] = [];
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new APIError("TMDB API rate limit exceeded", "tmdb", 429);
+        }
+        if (response.status === 401) {
+          throw new APIError("TMDB API authentication failed - check API key", "tmdb", 401);
+        }
+        throw new APIError(`TMDB API error: ${response.status}`, "tmdb", response.status);
+      }
 
+      const data: TMDBSearchResponse = await response.json();
+      
+      if (!data.results || !Array.isArray(data.results)) {
+        console.warn("🎬 TMDB: Unexpected API response structure");
+        return cachedResults; // Return cached results as fallback
+      }
+
+      console.log(`🎬 TMDB: Found ${data.results.length} movies`);
+
+      // Transform and cache results
+      const transformedResults: MediaSearchResult[] = [];
+      
       for (const movie of data.results) {
-        const movieResult = movie as TMDBMovieResult;
-        
-        // Check cache first
-        const cached = await ctx.runQuery(internal.media.mediaQueries.getCachedMedia, {
-          externalId: movieResult.id.toString(),
-          type: "movie"
-        });
+        try {
+          const movieData = movie as TMDBMovie;
+          const transformed = transformTMDBMovie(movieData);
+          
+          // Cache the movie
+          await ctx.runMutation(
+            internal.media.mediaQueries.cacheMediaItem,
+            {
+              externalId: transformed.externalId,
+              type: transformed.type,
+              title: transformed.title,
+              releaseYear: transformed.releaseYear,
+              posterUrl: transformed.posterUrl,
+              description: transformed.description,
+              artist: transformed.artist,
+              season: transformed.season,
+              rawData: movieData
+            }
+          );
 
-        if (cached) {
-          results.push({
-            externalId: cached.externalId,
-            type: cached.type,
-            title: cached.title,
-            releaseYear: cached.releaseYear,
-            posterUrl: cached.posterUrl,
-            description: cached.description,
-          });
-        } else {
-          // Transform and cache new result
-          const mediaResult: MediaSearchResult = {
-            externalId: movieResult.id.toString(),
-            type: "movie",
-            title: movieResult.title,
-            releaseYear: extractYear(movieResult.release_date),
-            posterUrl: standardizePosterUrl(movieResult.poster_path, "tmdb"),
-            description: cleanDescription(movieResult.overview),
-          };
-
-          // Cache the result - store minimal data instead of full rawData
-          await ctx.runMutation(internal.media.mediaQueries.cacheMediaItem, {
-            externalId: mediaResult.externalId,
-            type: mediaResult.type,
-            title: mediaResult.title,
-            releaseYear: mediaResult.releaseYear,
-            posterUrl: mediaResult.posterUrl,
-            description: mediaResult.description,
-            rawData: {
-              id: movieResult.id,
-              title: movieResult.title,
-              release_date: movieResult.release_date,
-              poster_path: movieResult.poster_path
-            }, // Store only essential fields
-          });
-
-          results.push(mediaResult);
+          transformedResults.push(transformed);
+        } catch (error) {
+          console.error(`🎬 TMDB: Error processing movie ${(movie as TMDBMovie).id}:`, error);
+          // Continue processing other movies
         }
       }
 
-      return results;
+      // Combine with cached results, removing duplicates
+      const allResults = [...cachedResults];
+      for (const newResult of transformedResults) {
+        if (!allResults.some(cached => cached.externalId === newResult.externalId)) {
+          allResults.push(newResult);
+        }
+      }
+
+      return allResults.slice(0, 20);
 
     } catch (error) {
+      console.error("🎬 TMDB: Search movies error:", error);
+      
       if (error instanceof APIError) {
         throw error;
       }
-      throw new APIError(
-        `Failed to search movies: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        "tmdb",
-        undefined,
-        error
-      );
+      
+      // Return cached results as fallback
+      if (cachedResults.length > 0) {
+        console.log(`🎬 TMDB: Returning cached results due to API error`);
+        return cachedResults;
+      }
+      
+      throw new APIError("Failed to search movies", "tmdb");
     }
-  },
+  }
 });
 
-// Search TV shows via TMDB API
+/**
+ * Search for TV shows using TMDB API
+ */
 export const searchTVShows = action({
-  args: { query: v.string(), page: v.optional(v.number()) },
+  args: { 
+    query: v.string(),
+    page: v.optional(v.number())
+  },
   handler: async (ctx, args): Promise<MediaSearchResult[]> => {
-    if (!TMDB_API_KEY) {
+    const { query, page = 1 } = args;
+
+    // SECURITY FIX: Better input validation
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
+      return [];
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (trimmedQuery.length > 100) {
+      throw new Error("Search query too long");
+    }
+
+    // Rate limiting check
+    await checkTMDBRateLimit(ctx);
+
+    // Check cache first - search for TV shows with matching titles
+    const cachedResults = await ctx.runQuery(
+      api.media.mediaQueries.searchCachedMedia,
+      { query: trimmedQuery, type: "tv", limit: 20 }
+    );
+
+    // If we have enough cached results, return them
+    if (cachedResults.length >= Math.min(20, 10)) {
+      console.log(`🎬 TMDB: Returning ${cachedResults.length} cached TV shows for "${trimmedQuery}"`);
+      return cachedResults;
+    }
+
+    // Call TMDB API
+    const apiKey = process.env.TMDB_API_KEY;
+    if (!apiKey) {
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Get current user for rate limiting
-    const identity = await ctx.auth.getUserIdentity();
-    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
-
-    // Check rate limiting with database-backed implementation
-    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
-      key: userRateLimitKey,
-      limit: 30, // 30 requests per hour per user
-      windowMs: 60 * 60 * 1000 // 1 hour
-    });
-
-    if (!rateLimitAllowed) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
-    }
-
-    const page = args.page || 1;
-    
     try {
-      const response = await makeSecureTMDBRequest('/search/tv', {
-        query: encodeURIComponent(args.query.trim()),
-        page: page.toString()
+      const searchParams = new URLSearchParams({
+        api_key: apiKey,
+        query: trimmedQuery,
+        page: page.toString(),
+        language: 'en-US'
       });
 
-      const data: TMDBSearchResponse = await handleAPIResponse(response, "tmdb");
+      console.log(`🎬 TMDB: Searching TV shows for "${trimmedQuery}"`);
+      
+      const response = await fetch(
+        `${TMDB_BASE_URL}/search/tv?${searchParams.toString()}`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'STACKD/1.0'
+          }
+        }
+      );
 
-      const results: MediaSearchResult[] = [];
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new APIError("TMDB API rate limit exceeded", "tmdb", 429);
+        }
+        if (response.status === 401) {
+          throw new APIError("TMDB API authentication failed - check API key", "tmdb", 401);
+        }
+        throw new APIError(`TMDB API error: ${response.status}`, "tmdb", response.status);
+      }
 
+      const data: TMDBSearchResponse = await response.json();
+      
+      if (!data.results || !Array.isArray(data.results)) {
+        console.warn("🎬 TMDB: Unexpected API response structure");
+        return cachedResults; // Return cached results as fallback
+      }
+
+      console.log(`🎬 TMDB: Found ${data.results.length} TV shows`);
+
+      // Transform and cache results
+      const transformedResults: MediaSearchResult[] = [];
+      
       for (const show of data.results) {
-        const tvResult = show as TMDBTVResult;
-        
-        // Check cache first
-        const cached = await ctx.runQuery(internal.media.mediaQueries.getCachedMedia, {
-          externalId: tvResult.id.toString(),
-          type: "tv"
-        });
+        try {
+          const tvData = show as TMDBTVShow;
+          const transformed = transformTMDBTVShow(tvData);
+          
+          // Cache the TV show
+          await ctx.runMutation(
+            internal.media.mediaQueries.cacheMediaItem,
+            {
+              externalId: transformed.externalId,
+              type: transformed.type,
+              title: transformed.title,
+              releaseYear: transformed.releaseYear,
+              posterUrl: transformed.posterUrl,
+              description: transformed.description,
+              artist: transformed.artist,
+              season: transformed.season,
+              rawData: tvData
+            }
+          );
 
-        if (cached) {
-          results.push({
-            externalId: cached.externalId,
-            type: cached.type,
-            title: cached.title,
-            releaseYear: cached.releaseYear,
-            posterUrl: cached.posterUrl,
-            description: cached.description,
-            season: cached.season,
-          });
-        } else {
-          // Transform and cache new result
-          const mediaResult: MediaSearchResult = {
-            externalId: tvResult.id.toString(),
-            type: "tv",
-            title: tvResult.name,
-            releaseYear: extractYear(tvResult.first_air_date),
-            posterUrl: standardizePosterUrl(tvResult.poster_path, "tmdb"),
-            description: cleanDescription(tvResult.overview),
-            season: 1, // Default to season 1 for new TV shows
-          };
-
-          // Cache the result
-          await ctx.runMutation(internal.media.mediaQueries.cacheMediaItem, {
-            externalId: mediaResult.externalId,
-            type: mediaResult.type,
-            title: mediaResult.title,
-            releaseYear: mediaResult.releaseYear,
-            posterUrl: mediaResult.posterUrl,
-            description: mediaResult.description,
-            season: mediaResult.season,
-            rawData: {
-              id: tvResult.id,
-              name: tvResult.name,
-              first_air_date: tvResult.first_air_date,
-              poster_path: tvResult.poster_path
-            }, // Store minimal data
-          });
-
-          results.push(mediaResult);
+          transformedResults.push(transformed);
+        } catch (error) {
+          console.error(`🎬 TMDB: Error processing TV show ${(show as TMDBTVShow).id}:`, error);
+          // Continue processing other shows
         }
       }
 
-      return results;
+      // Combine with cached results, removing duplicates
+      const allResults = [...cachedResults];
+      for (const newResult of transformedResults) {
+        if (!allResults.some(cached => cached.externalId === newResult.externalId)) {
+          allResults.push(newResult);
+        }
+      }
+
+      return allResults.slice(0, 20);
 
     } catch (error) {
+      console.error("🎬 TMDB: Search TV shows error:", error);
+      
       if (error instanceof APIError) {
         throw error;
       }
-      throw new APIError(
-        `Failed to search TV shows: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        "tmdb",
-        undefined,
-        error
-      );
+      
+      // Return cached results as fallback
+      if (cachedResults.length > 0) {
+        console.log(`🎬 TMDB: Returning cached results due to API error`);
+        return cachedResults;
+      }
+      
+      throw new APIError("Failed to search TV shows", "tmdb");
     }
-  },
+  }
 });
 
-// Get detailed movie info (for dynamic pages)
+/**
+ * Get detailed information about a specific movie
+ */
 export const getMovieDetails = action({
   args: { movieId: v.string() },
-  handler: async (ctx, args): Promise<any> => {
-    if (!TMDB_API_KEY) {
+  handler: async (ctx, args): Promise<MediaSearchResult | null> => {
+    const { movieId } = args;
+
+    // Rate limiting check
+    await checkTMDBRateLimit(ctx);
+
+    // Check cache first
+    const cached = await ctx.runQuery(
+      internal.media.mediaQueries.getCachedMedia,
+      { externalId: movieId, type: "movie" }
+    );
+
+    if (cached && cached._creationTime > Date.now() - 7 * 24 * 60 * 60 * 1000) {
+      console.log(`🎬 TMDB: Returning cached movie details for ${movieId}`);
+      return {
+        externalId: cached.externalId,
+        type: cached.type,
+        title: cached.title,
+        releaseYear: cached.releaseYear,
+        posterUrl: cached.posterUrl,
+        description: cached.description,
+        artist: cached.artist,
+        season: cached.season
+      };
+    }
+
+    // Call TMDB API for details
+    const apiKey = process.env.TMDB_API_KEY;
+    if (!apiKey) {
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Check cache first
-    const cached = await ctx.runQuery(internal.media.mediaQueries.getCachedMedia, {
-      externalId: args.movieId,
-      type: "movie"
-    });
-
-    if (cached) {
-      return cached;
-    }
-
-    // Get current user for rate limiting
-    const identity = await ctx.auth.getUserIdentity();
-    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
-
-    // Check rate limiting with database-backed implementation
-    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
-      key: userRateLimitKey,
-      limit: 30, // 30 requests per hour per user
-      windowMs: 60 * 60 * 1000 // 1 hour
-    });
-
-    if (!rateLimitAllowed) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
-    }
-
     try {
-      const response = await makeSecureTMDBRequest(`/movie/${args.movieId}`);
-      const movie: TMDBMovieResult = await handleAPIResponse(response, "tmdb");
+      console.log(`🎬 TMDB: Fetching movie details for ${movieId}`);
+      
+      const response = await fetch(
+        `${TMDB_BASE_URL}/movie/${movieId}?api_key=${apiKey}&language=en-US`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'STACKD/1.0'
+          }
+        }
+      );
 
-      // Cache and return detailed info
-      const mediaId = await ctx.runMutation(internal.media.mediaQueries.cacheMediaItem, {
-        externalId: movie.id.toString(),
-        type: "movie",
-        title: movie.title,
-        releaseYear: extractYear(movie.release_date),
-        posterUrl: standardizePosterUrl(movie.poster_path, "tmdb"),
-        description: cleanDescription(movie.overview),
-        rawData: {
-          id: movie.id,
-          title: movie.title,
-          release_date: movie.release_date,
-          poster_path: movie.poster_path
-        },
-      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          return null;
+        }
+        if (response.status === 429) {
+          throw new APIError("TMDB API rate limit exceeded", "tmdb", 429);
+        }
+        if (response.status === 401) {
+          throw new APIError("TMDB API authentication failed", "tmdb", 401);
+        }
+        throw new APIError(`TMDB API error: ${response.status}`, "tmdb", response.status);
+      }
 
-      return await ctx.runQuery(internal.media.mediaQueries.getMediaById, { mediaId });
+      const movie: TMDBMovie = await response.json();
+      const transformed = transformTMDBMovie(movie);
+
+      // Cache the detailed movie info
+      await ctx.runMutation(
+        internal.media.mediaQueries.cacheMediaItem,
+        {
+          externalId: transformed.externalId,
+          type: transformed.type,
+          title: transformed.title,
+          releaseYear: transformed.releaseYear,
+          posterUrl: transformed.posterUrl,
+          description: transformed.description,
+          artist: transformed.artist,
+          season: transformed.season,
+          rawData: movie
+        }
+      );
+
+      console.log(`🎬 TMDB: Cached movie details for "${movie.title}"`);
+      return transformed;
 
     } catch (error) {
+      console.error("🎬 TMDB: Movie details error:", error);
+      
       if (error instanceof APIError) {
         throw error;
       }
-      throw new APIError(
-        `Failed to get movie details: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        "tmdb",
-        undefined,
-        error
-      );
+      
+      // Return cached result as fallback (even if older)
+      if (cached) {
+        console.log(`🎬 TMDB: Returning stale cache due to API error`);
+        return {
+          externalId: cached.externalId,
+          type: cached.type,
+          title: cached.title,
+          releaseYear: cached.releaseYear,
+          posterUrl: cached.posterUrl,
+          description: cached.description,
+          artist: cached.artist,
+          season: cached.season
+        };
+      }
+      
+      throw new APIError("Failed to get movie details", "tmdb");
     }
-  },
+  }
 });
 
-// Get detailed TV show info (for dynamic pages)
+/**
+ * Get detailed information about a specific TV show
+ */
 export const getTVDetails = action({
   args: { tvId: v.string() },
-  handler: async (ctx, args): Promise<any> => {
-    if (!TMDB_API_KEY) {
+  handler: async (ctx, args): Promise<MediaSearchResult | null> => {
+    const { tvId } = args;
+
+    // Rate limiting check
+    await checkTMDBRateLimit(ctx);
+
+    // Check cache first
+    const cached = await ctx.runQuery(
+      internal.media.mediaQueries.getCachedMedia,
+      { externalId: tvId, type: "tv" }
+    );
+
+    if (cached && cached._creationTime > Date.now() - 7 * 24 * 60 * 60 * 1000) {
+      console.log(`🎬 TMDB: Returning cached TV details for ${tvId}`);
+      return {
+        externalId: cached.externalId,
+        type: cached.type,
+        title: cached.title,
+        releaseYear: cached.releaseYear,
+        posterUrl: cached.posterUrl,
+        description: cached.description,
+        artist: cached.artist,
+        season: cached.season
+      };
+    }
+
+    // Call TMDB API for details
+    const apiKey = process.env.TMDB_API_KEY;
+    if (!apiKey) {
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Check cache first
-    const cached = await ctx.runQuery(internal.media.mediaQueries.getCachedMedia, {
-      externalId: args.tvId,
-      type: "tv"
-    });
-
-    if (cached) {
-      return cached;
-    }
-
-    // Get current user for rate limiting
-    const identity = await ctx.auth.getUserIdentity();
-    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
-
-    // Check rate limiting with database-backed implementation
-    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
-      key: userRateLimitKey,
-      limit: 30, // 30 requests per hour per user
-      windowMs: 60 * 60 * 1000 // 1 hour
-    });
-
-    if (!rateLimitAllowed) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
-    }
-
     try {
-      const response = await makeSecureTMDBRequest(`/tv/${args.tvId}`);
-      const show: TMDBTVResult = await handleAPIResponse(response, "tmdb");
+      console.log(`🎬 TMDB: Fetching TV details for ${tvId}`);
+      
+      const response = await fetch(
+        `${TMDB_BASE_URL}/tv/${tvId}?api_key=${apiKey}&language=en-US`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'STACKD/1.0'
+          }
+        }
+      );
 
-      // Cache and return detailed info
-      const mediaId = await ctx.runMutation(internal.media.mediaQueries.cacheMediaItem, {
-        externalId: show.id.toString(),
-        type: "tv",
-        title: show.name,
-        releaseYear: extractYear(show.first_air_date),
-        posterUrl: standardizePosterUrl(show.poster_path, "tmdb"),
-        description: cleanDescription(show.overview),
-        season: 1,
-        rawData: {
-          id: show.id,
-          name: show.name,
-          first_air_date: show.first_air_date,
-          poster_path: show.poster_path
-        },
-      });
+      if (!response.ok) {
+        if (response.status === 404) {
+          return null;
+        }
+        if (response.status === 429) {
+          throw new APIError("TMDB API rate limit exceeded", "tmdb", 429);
+        }
+        if (response.status === 401) {
+          throw new APIError("TMDB API authentication failed", "tmdb", 401);
+        }
+        throw new APIError(`TMDB API error: ${response.status}`, "tmdb", response.status);
+      }
 
-      return await ctx.runQuery(internal.media.mediaQueries.getMediaById, { mediaId });
+      const show: TMDBTVShow = await response.json();
+      const transformed = transformTMDBTVShow(show);
+
+      // Cache the detailed TV show info
+      await ctx.runMutation(
+        internal.media.mediaQueries.cacheMediaItem,
+        {
+          externalId: transformed.externalId,
+          type: transformed.type,
+          title: transformed.title,
+          releaseYear: transformed.releaseYear,
+          posterUrl: transformed.posterUrl,
+          description: transformed.description,
+          artist: transformed.artist,
+          season: transformed.season,
+          rawData: show
+        }
+      );
+
+      console.log(`🎬 TMDB: Cached TV details for "${show.name}"`);
+      return transformed;
 
     } catch (error) {
+      console.error("🎬 TMDB: TV details error:", error);
+      
       if (error instanceof APIError) {
         throw error;
       }
-      throw new APIError(
-        `Failed to get TV details: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        "tmdb",
-        undefined,
-        error
-      );
+      
+      // Return cached result as fallback (even if older)
+      if (cached) {
+        console.log(`🎬 TMDB: Returning stale cache due to API error`);
+        return {
+          externalId: cached.externalId,
+          type: cached.type,
+          title: cached.title,
+          releaseYear: cached.releaseYear,
+          posterUrl: cached.posterUrl,
+          description: cached.description,
+          artist: cached.artist,
+          season: cached.season
+        };
+      }
+      
+      throw new APIError("Failed to get TV details", "tmdb");
     }
-  },
+  }
 });

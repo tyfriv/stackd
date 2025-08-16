@@ -1,6 +1,7 @@
 // convex/reactions.ts
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { Id } from "./_generated/dataModel";
 import { notifyReaction } from "./lib/notificationHelpers";
 
@@ -15,6 +16,17 @@ export const toggleReaction = mutation({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
       throw new Error("Not authenticated");
+    }
+
+    // SECURITY FIX: Add rate limiting for reactions
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: `toggle_reaction_${identity.subject}`,
+      limit: 100, // 100 reactions per hour
+      windowMs: 60 * 60 * 1000
+    });
+
+    if (!rateLimitAllowed) {
+      throw new Error("Rate limit exceeded for reactions");
     }
 
     // Get current user
@@ -173,6 +185,13 @@ export const getTargetReactions = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    // SECURITY FIX: Validate limit parameter
+    let limit = args.limit || 50;
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 50;
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 100);
+
     let reactions;
 
     if (args.reactionType) {
@@ -185,7 +204,7 @@ export const getTargetReactions = query({
            .eq("reactionType", args.reactionType!)
         )
         .order("desc")
-        .take(args.limit || 50);
+        .take(limit);
     } else {
       // Get all reactions for the target
       reactions = await ctx.db
@@ -194,7 +213,7 @@ export const getTargetReactions = query({
           q.eq("targetType", args.targetType).eq("targetId", args.targetId)
         )
         .order("desc")
-        .take(args.limit || 50);
+        .take(limit);
     }
 
     // Get user details for each reaction
@@ -242,11 +261,18 @@ export const getUserRecentReactions = query({
       targetUserId = currentUser._id;
     }
 
+    // SECURITY FIX: Validate limit parameter
+    let limit = args.limit || 20;
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 20;
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 50);
+
     const reactions = await ctx.db
       .query("reactions")
       .withIndex("by_user", (q) => q.eq("userId", targetUserId))
       .order("desc")
-      .take(args.limit || 20);
+      .take(limit);
 
     // Get target details for each reaction
     const reactionsWithTargets = await Promise.all(

@@ -16,10 +16,12 @@ export interface MediaSearchResult {
   season?: number; // For TV shows
 }
 
-// Cache configuration
+// Cache configuration - only for external API data and computed content
 export const CACHE_DURATION = {
-  MEDIA_ITEM: 7 * 24 * 60 * 60 * 1000, // 1 week in milliseconds
-  SEARCH_RESULTS: 24 * 60 * 60 * 1000,  // 1 day in milliseconds
+  MEDIA_ITEM: 7 * 24 * 60 * 60 * 1000, // 1 week in milliseconds - external API data changes rarely
+  SEARCH_RESULTS: 24 * 60 * 60 * 1000,  // 1 day in milliseconds - search results from external APIs
+  TRENDING_CONTENT: 2 * 60 * 60 * 1000, // 2 hours for trending content - computed from user activity
+  // NOTE: User profiles should NOT be cached - they need real-time updates
 };
 
 // Check if cached item is still fresh

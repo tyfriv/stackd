@@ -1,7 +1,9 @@
 // convex/comments.ts
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
 import { notifyComment } from "./lib/notificationHelpers";
+import { sanitizeInput, containsBlockedContent } from "./lib/validation";
 
 // Create a comment on a review/log
 export const createComment = mutation({
@@ -13,6 +15,17 @@ export const createComment = mutation({
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
       throw new Error("Not authenticated");
+    }
+
+    // SECURITY FIX: Add rate limiting for comments
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: `create_comment_${identity.subject}`,
+      limit: 30, // 30 comments per hour
+      windowMs: 60 * 60 * 1000
+    });
+
+    if (!rateLimitAllowed) {
+      throw new Error("Rate limit exceeded for comments");
     }
 
     // Get current user
@@ -69,26 +82,32 @@ export const createComment = mutation({
       }
     }
 
-    // Validate content length
-    if (args.content.trim().length === 0) {
+    // SECURITY FIX: Validate and sanitize content
+    const sanitizedContent = sanitizeInput(args.content);
+    
+    if (sanitizedContent.trim().length === 0) {
       throw new Error("Comment cannot be empty");
     }
 
-    if (args.content.length > 1000) {
+    if (sanitizedContent.length > 1000) {
       throw new Error("Comment too long (max 1000 characters)");
+    }
+
+    if (containsBlockedContent(sanitizedContent)) {
+      throw new Error("Comment contains inappropriate content");
     }
 
     // Create the comment
     const commentId = await ctx.db.insert("reviewComments", {
       logId: args.logId,
       userId: user._id,
-      content: args.content.trim(),
+      content: sanitizedContent,
       createdAt: Date.now(),
     });
 
     // Create notification for log owner (if not commenting on own log)
     if (log.userId !== user._id) {
-      await notifyComment(ctx, log.userId, user._id, args.logId, args.content.trim());
+      await notifyComment(ctx, log.userId, user._id, args.logId, sanitizedContent);
     }
 
     return commentId;
@@ -216,17 +235,23 @@ export const updateComment = mutation({
       throw new Error("Not authorized to update this comment");
     }
 
-    // Validate content
-    if (args.content.trim().length === 0) {
+    // SECURITY FIX: Validate and sanitize content
+    const sanitizedContent = sanitizeInput(args.content);
+    
+    if (sanitizedContent.trim().length === 0) {
       throw new Error("Comment cannot be empty");
     }
 
-    if (args.content.length > 1000) {
+    if (sanitizedContent.length > 1000) {
       throw new Error("Comment too long (max 1000 characters)");
     }
 
+    if (containsBlockedContent(sanitizedContent)) {
+      throw new Error("Comment contains inappropriate content");
+    }
+
     await ctx.db.patch(args.commentId, {
-      content: args.content.trim(),
+      content: sanitizedContent,
     });
 
     return { success: true };
@@ -277,6 +302,62 @@ export const getLogCommentsCount = query({
     logId: v.id("logs"),
   },
   handler: async (ctx, args) => {
+    // SECURITY FIX: Check log visibility before returning comment count
+    const log = await ctx.db.get(args.logId);
+    if (!log) {
+      throw new Error("Log not found");
+    }
+
+    // Check if current user can see this log
+    const identity = await ctx.auth.getUserIdentity();
+    let canSee = false;
+
+    if (log.visibility === "public") {
+      canSee = true;
+    } else if (identity) {
+      const user = await ctx.db
+        .query("users")
+        .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
+        .unique();
+
+      if (user) {
+        // Owner can always see their own content
+        if (user._id === log.userId) {
+          canSee = true;
+        } else if (log.visibility === "followers") {
+          // Check if user follows the log owner
+          const followRelationship = await ctx.db
+            .query("follows")
+            .withIndex("by_relationship", (q) =>
+              q.eq("followerId", user._id).eq("followingId", log.userId)
+            )
+            .unique();
+
+          if (followRelationship) {
+            // Also check no blocking relationship exists
+            const [isBlocked, isBlockedBy] = await Promise.all([
+              ctx.db
+                .query("blocks")
+                .withIndex("by_blocker", (q) => q.eq("blockerId", user._id))
+                .filter((q) => q.eq(q.field("blockedId"), log.userId))
+                .unique(),
+              ctx.db
+                .query("blocks")
+                .withIndex("by_blocker", (q) => q.eq("blockerId", log.userId))
+                .filter((q) => q.eq(q.field("blockedId"), user._id))
+                .unique(),
+            ]);
+
+            canSee = !isBlocked && !isBlockedBy;
+          }
+        }
+      }
+    }
+
+    if (!canSee) {
+      throw new Error("Cannot view comments on this review");
+    }
+
     const comments = await ctx.db
       .query("reviewComments")
       .withIndex("by_log", (q) => q.eq("logId", args.logId))
@@ -298,6 +379,9 @@ export const getUserRecentComments = query({
       throw new Error("Not authenticated");
     }
 
+    // SECURITY FIX: Validate limit parameter
+    const limit = Math.min(Math.max(args.limit || 20, 1), 100); // Clamp between 1-100
+
     let targetUserId = args.userId;
     
     if (!targetUserId) {
@@ -316,7 +400,7 @@ export const getUserRecentComments = query({
       .query("reviewComments")
       .withIndex("by_user", (q) => q.eq("userId", targetUserId))
       .order("desc")
-      .take(args.limit || 20);
+      .take(limit);
 
     // Get log details for each comment
     const commentsWithDetails = await Promise.all(

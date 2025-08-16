@@ -2,7 +2,9 @@
 import { v } from "convex/values";
 import { mutation, query } from "../_generated/server";
 import { Id } from "../_generated/dataModel";
+import { internal } from "../_generated/api";
 import { notifyFollow } from "../lib/notificationHelpers";
+import { createError } from "../lib/errors";
 
 // Follow a user
 export const follow = mutation({
@@ -12,7 +14,18 @@ export const follow = mutation({
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
-      throw new Error("Not authenticated");
+      throw createError("AUTH_ERROR", "Not authenticated");
+    }
+
+    // SECURITY FIX: Add rate limiting for follows
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: `follow_${identity.subject}`,
+      limit: 50, // 50 follows per hour
+      windowMs: 60 * 60 * 1000
+    });
+
+    if (!rateLimitAllowed) {
+      throw createError("RATE_LIMITED", "Rate limit exceeded for follow actions");
     }
 
     // Get current user
@@ -22,18 +35,18 @@ export const follow = mutation({
       .unique();
 
     if (!currentUser) {
-      throw new Error("User not found");
+      throw createError("NOT_FOUND", "User not found");
     }
 
     // Validate target user exists
     const targetUser = await ctx.db.get(args.followingId);
     if (!targetUser) {
-      throw new Error("Target user not found");
+      throw createError("NOT_FOUND", "Target user not found");
     }
 
     // Can't follow yourself
     if (currentUser._id === args.followingId) {
-      throw new Error("Cannot follow yourself");
+      throw createError("VALIDATION_ERROR", "Cannot follow yourself");
     }
 
     // Check if already following
@@ -45,7 +58,7 @@ export const follow = mutation({
       .unique();
 
     if (existingFollow) {
-      throw new Error("Already following this user");
+      throw createError("DUPLICATE_RESOURCE", "Already following this user");
     }
 
     // Check if target user has blocked current user
@@ -56,7 +69,7 @@ export const follow = mutation({
       .unique();
 
     if (isBlockedBy) {
-      throw new Error("Cannot follow this user");
+      throw createError("UNAUTHORIZED", "Cannot follow this user");
     }
 
     // Create follow relationship
@@ -81,7 +94,7 @@ export const unfollow = mutation({
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
     if (!identity) {
-      throw new Error("Not authenticated");
+      throw createError("AUTH_ERROR", "Not authenticated");
     }
 
     const currentUser = await ctx.db
@@ -90,7 +103,7 @@ export const unfollow = mutation({
       .unique();
 
     if (!currentUser) {
-      throw new Error("User not found");
+      throw createError("NOT_FOUND", "User not found");
     }
 
     // Find follow relationship
@@ -102,7 +115,7 @@ export const unfollow = mutation({
       .unique();
 
     if (!followRelationship) {
-      throw new Error("Not following this user");
+      throw createError("NOT_FOUND", "Not following this user");
     }
 
     // Delete follow relationship
@@ -153,7 +166,15 @@ export const getFollowers = query({
     })),
   },
   handler: async (ctx, args) => {
-    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
+    // SECURITY FIX: Validate pagination options
+    let paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
+    
+    if (paginationOpts.numItems) {
+      if (typeof paginationOpts.numItems !== 'number' || isNaN(paginationOpts.numItems) || !isFinite(paginationOpts.numItems)) {
+        paginationOpts.numItems = 20;
+      }
+      paginationOpts.numItems = Math.min(Math.max(Math.floor(paginationOpts.numItems), 1), 100);
+    }
 
     const follows = await ctx.db
       .query("follows")
@@ -191,7 +212,15 @@ export const getFollowing = query({
     })),
   },
   handler: async (ctx, args) => {
-    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
+    // SECURITY FIX: Validate pagination options
+    let paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
+    
+    if (paginationOpts.numItems) {
+      if (typeof paginationOpts.numItems !== 'number' || isNaN(paginationOpts.numItems) || !isFinite(paginationOpts.numItems)) {
+        paginationOpts.numItems = 20;
+      }
+      paginationOpts.numItems = Math.min(Math.max(Math.floor(paginationOpts.numItems), 1), 100);
+    }
 
     const follows = await ctx.db
       .query("follows")
@@ -266,7 +295,12 @@ export const getMutualFollows = query({
       return [];
     }
 
-    const limit = args.limit || 5;
+    // SECURITY FIX: Validate limit parameter
+    let limit = args.limit || 5;
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 5;
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 20);
 
     // Get users that current user follows
     const currentUserFollowing = await ctx.db
@@ -322,7 +356,12 @@ export const getFollowSuggestions = query({
       return [];
     }
 
-    const limit = args.limit || 10;
+    // SECURITY FIX: Validate limit parameter
+    let limit = args.limit || 10;
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 10;
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 50);
 
     // Get users current user is following
     const following = await ctx.db

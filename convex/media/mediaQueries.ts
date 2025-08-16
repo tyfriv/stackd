@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internalMutation, internalQuery, query } from "../_generated/server";
+import { internalMutation, internalQuery, query, mutation } from "../_generated/server";
 import { Doc, Id } from "../_generated/dataModel";
 import { MediaSearchResult, isCacheValid, mediaDocToSearchResult } from "../lib/apiHelpers";
 
@@ -89,10 +89,25 @@ export const searchCachedMedia = query({
     limit: v.optional(v.number())
   },
   handler: async (ctx, args) => {
-    const limit = args.limit || 10;
+    // SECURITY FIX: Validate search input, but allow empty for internal API cache checks
+    const trimmedQuery = args.query.trim();
+    
+    if (trimmedQuery.length === 0) {
+      return []; // Return empty results for empty queries
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (args.query.length > 100) {
+      throw new Error("Search query too long");
+    }
+
+    const limit = Math.min(Math.max(args.limit || 10, 1), 50); // Clamp between 1-50
     
     let searchQuery = ctx.db.query("media").withSearchIndex("search_title", (q) => 
-      q.search("title", args.query)
+      q.search("title", trimmedQuery)
     );
 
     if (args.type) {
@@ -177,9 +192,7 @@ export const cleanExpiredCache = internalMutation({
   },
 });
 
-// Add this mutation to your existing convex/media/mediaQueries.ts file
 
-import { mutation } from "../_generated/server";
 
 // Helper function to get or create media item from search result
 export const getOrCreateMediaFromSearch = mutation({

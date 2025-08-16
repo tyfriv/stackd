@@ -29,6 +29,17 @@ export const createLog = mutation({
       throw new StackdError("Not authenticated", "AUTH_ERROR", 401);
     }
 
+    // SECURITY FIX: Add rate limiting for log creation
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: `create_log_${identity.subject}`,
+      limit: 20, // 20 logs per hour
+      windowMs: 60 * 60 * 1000
+    });
+
+    if (!rateLimitAllowed) {
+      throw new StackdError("Rate limit exceeded for log creation", "RATE_LIMITED", 429);
+    }
+
     const user = await ctx.db
       .query("users")
       .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
@@ -311,8 +322,11 @@ export const getUserLogs = query({
   handler: async (ctx, args) => {
     let { mediaType, limit = 20 } = args;
     
-    // Validate and sanitize limit
-    limit = Math.min(Math.max(limit, 1), 50); // Between 1 and 50
+    // SECURITY FIX: Validate and sanitize limit with additional checks
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 20; // Default fallback
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 50); // Between 1 and 50, integers only
     
     // Get target user (or current user if not specified)
     let targetUserId = args.userId;
@@ -365,23 +379,24 @@ export const getUserLogs = query({
     
     const logs = await query.order("desc").take(limit + 1); // +1 to check if there are more
 
-    // Filter logs based on visibility
-    const filteredLogs = logs.filter(log => {
-      if (isOwnLogs) return true; // User can see their own logs
-      if (log.visibility === "public") return true;
-      if (log.visibility === "followers" && isFollowing) return true;
-      return false;
-    });
+    // Filter logs based on visibility with improved performance
+    const visibleLogs = [];
+    for (const log of logs) {
+      if (isOwnLogs || log.visibility === "public" || (log.visibility === "followers" && isFollowing)) {
+        visibleLogs.push(log);
+        if (visibleLogs.length >= limit) break; // Early termination
+      }
+    }
 
-    // Get media info for each log with batch loading  
-    const mediaIds = [...new Set(filteredLogs.slice(0, limit).map(log => log.mediaId))];
+    // PERFORMANCE FIX: Batch media loading with optimized queries
+    const mediaIds = [...new Set(visibleLogs.map(log => log.mediaId))];
     const mediaLookups = await Promise.all(mediaIds.map(id => ctx.db.get(id)));
     const mediaMap = new Map();
     mediaLookups.forEach((media, i) => {
       if (media) mediaMap.set(mediaIds[i], media);
     });
 
-    const logsWithMedia = filteredLogs.slice(0, limit).map((log) => {
+    const logsWithMedia = visibleLogs.map((log) => {
       const media = mediaMap.get(log.mediaId);
       
       // Apply media type filter
@@ -397,7 +412,7 @@ export const getUserLogs = query({
 
     return {
       logs: logsWithMedia,
-      hasMore: filteredLogs.length > limit,
+      hasMore: logs.length > limit,
       nextCursor: logsWithMedia.length > 0 ? logsWithMedia[logsWithMedia.length - 1]._id : null,
     };
   },
@@ -509,7 +524,12 @@ export const getMediaLogs = query({
   },
   handler: async (ctx, args) => {
     let { limit = 20 } = args;
-    limit = Math.min(Math.max(limit, 1), 50); // Between 1 and 50
+    
+    // SECURITY FIX: Validate and sanitize limit
+    if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
+      limit = 20;
+    }
+    limit = Math.min(Math.max(Math.floor(limit), 1), 50); // Between 1 and 50, integers only
 
     // Get current user for visibility filtering
     const identity = await ctx.auth.getUserIdentity();
@@ -537,33 +557,30 @@ export const getMediaLogs = query({
       if (user) userMap.set(userIds[i], user);
     });
 
+    // PERFORMANCE FIX: Batch follow relationship checks
+    const followingRelations = currentUser ? await ctx.db
+      .query("follows")
+      .withIndex("by_follower", (q) => q.eq("followerId", currentUser._id))
+      .collect() : [];
+    
+    const followingIds = new Set(followingRelations.map(f => f.followingId));
+
     // Filter by visibility and add user info
-    const visibleLogs = await Promise.all(
-      logs.slice(0, limit).map(async (log) => {
-        const logOwner = userMap.get(log.userId);
-        
-        // Check visibility
-        const isOwnLog = currentUser && currentUser._id === log.userId;
-        if (isOwnLog || log.visibility === "public") {
-          return { ...log, author: logOwner };
-        }
-        
-        if (log.visibility === "followers" && currentUser) {
-          const isFollowing = await ctx.db
-            .query("follows")
-            .withIndex("by_relationship", (q) => 
-              q.eq("followerId", currentUser._id).eq("followingId", log.userId)
-            )
-            .unique();
-            
-          if (isFollowing) {
-            return { ...log, author: logOwner };
-          }
-        }
-        
-        return null;
-      })
-    );
+    const visibleLogs = logs.slice(0, limit).map((log) => {
+      const logOwner = userMap.get(log.userId);
+      
+      // Check visibility
+      const isOwnLog = currentUser && currentUser._id === log.userId;
+      if (isOwnLog || log.visibility === "public") {
+        return { ...log, author: logOwner };
+      }
+      
+      if (log.visibility === "followers" && followingIds.has(log.userId)) {
+        return { ...log, author: logOwner };
+      }
+      
+      return null;
+    }).filter(log => log !== null);
 
     const validLogs = visibleLogs.filter(log => log !== null);
 

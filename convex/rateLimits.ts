@@ -24,11 +24,12 @@ export const checkRateLimit = internalMutation({
       await ctx.db.delete(entry._id);
     }
     
-    // Count current requests for this key
+    // PERFORMANCE FIX: Use compound index for better query performance
     const currentRequests = await ctx.db
       .query("rateLimits")
-      .withIndex("by_key", (q) => q.eq("key", args.key))
-      .filter((q) => q.gte(q.field("timestamp"), windowStart))
+      .withIndex("by_key_timestamp", (q) => 
+        q.eq("key", args.key).gte("timestamp", windowStart)
+      )
       .collect();
     
     if (currentRequests.length >= args.limit) {
@@ -57,8 +58,9 @@ export const getRateLimitStatus = query({
     
     const requests = await ctx.db
       .query("rateLimits")
-      .withIndex("by_key", (q) => q.eq("key", args.key))
-      .filter((q) => q.gte(q.field("timestamp"), windowStart))
+      .withIndex("by_key_timestamp", (q) => 
+        q.eq("key", args.key).gte("timestamp", windowStart)
+      )
       .collect();
     
     return {

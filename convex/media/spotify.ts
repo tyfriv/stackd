@@ -233,8 +233,18 @@ export const searchMusic = action({
   handler: async (ctx, args): Promise<MediaSearchResult[]> => {
     const { query, limit = 20, offset = 0 } = args;
 
-    if (!query.trim()) {
+    // SECURITY FIX: Better input validation
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
       return [];
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (trimmedQuery.length > 100) {
+      throw new Error("Search query too long");
     }
 
     // Rate limiting check - Spotify allows more requests than RAWG
@@ -254,7 +264,7 @@ export const searchMusic = action({
     // Check cache first - search for music with matching titles
     const cachedResults = await ctx.runQuery(
       api.media.mediaQueries.searchCachedMedia,
-      { query: query.trim(), type: "music", limit }
+      { query: trimmedQuery, type: "music", limit }
     );
 
     // If we have enough cached results, return them
@@ -266,14 +276,14 @@ export const searchMusic = action({
     try {
       const accessToken = await getSpotifyAccessToken();
       const searchParams = new URLSearchParams({
-        q: query.trim(),
+        q: trimmedQuery,
         type: 'track',
         limit: Math.min(limit, 50).toString(), // Spotify allows up to 50
         offset: offset.toString(),
         market: 'US' // Get market-specific results
       });
 
-      console.log(`🎵 Spotify: Searching music for "${query}"`);
+      console.log(`🎵 Spotify: Searching music for "${trimmedQuery}"`);
       
       const response = await fetch(
         `${SPOTIFY_BASE_URL}/search?${searchParams.toString()}`,
@@ -377,8 +387,18 @@ export const searchAlbums = action({
   handler: async (ctx, args): Promise<MediaSearchResult[]> => {
     const { query, limit = 20, offset = 0 } = args;
 
-    if (!query.trim()) {
+    // SECURITY FIX: Better input validation
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
       return [];
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (trimmedQuery.length > 100) {
+      throw new Error("Search query too long");
     }
 
     // Rate limiting check
@@ -398,14 +418,14 @@ export const searchAlbums = action({
     try {
       const accessToken = await getSpotifyAccessToken();
       const searchParams = new URLSearchParams({
-        q: query.trim(),
+        q: trimmedQuery,
         type: 'album',
         limit: Math.min(limit, 50).toString(),
         offset: offset.toString(),
         market: 'US'
       });
 
-      console.log(`🎵 Spotify: Searching albums for "${query}"`);
+      console.log(`🎵 Spotify: Searching albums for "${trimmedQuery}"`);
       
       const response = await fetch(
         `${SPOTIFY_BASE_URL}/search?${searchParams.toString()}`,

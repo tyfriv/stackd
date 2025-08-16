@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { sanitizeUsername, validateUsername } from "./lib/validation";
+import { sanitizeUsername, validateUsername, sanitizeBio } from "./lib/validation";
 
 // Get current authenticated user (read only)
 export const getCurrentUser = query({
@@ -106,6 +106,18 @@ export const updateProfile = mutation({
       throw new Error("Not authenticated");
     }
 
+    // SECURITY FIX: Add rate limiting for profile updates
+    const { internal } = await import("./_generated/api");
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: `update_profile_${identity.subject}`,
+      limit: 10, // 10 profile updates per hour
+      windowMs: 60 * 60 * 1000
+    });
+
+    if (!rateLimitAllowed) {
+      throw new Error("Rate limit exceeded for profile updates");
+    }
+
     const user = await ctx.db
       .query("users")
       .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
@@ -115,8 +127,14 @@ export const updateProfile = mutation({
       throw new Error("User not found");
     }
 
+    // SECURITY FIX: Sanitize bio content
+    let sanitizedBio = undefined;
+    if (args.bio !== undefined) {
+      sanitizedBio = args.bio.length > 0 ? sanitizeBio(args.bio) : undefined;
+    }
+
     await ctx.db.patch(user._id, {
-      bio: args.bio,
+      bio: sanitizedBio,
       profileImage: args.profileImage,
     });
 
@@ -128,9 +146,15 @@ export const updateProfile = mutation({
 export const checkUsernameAvailable = query({
   args: { username: v.string() },
   handler: async (ctx, args) => {
+    // SECURITY FIX: Validate username before checking availability
+    if (!validateUsername(args.username)) {
+      return false; // Invalid usernames are not available
+    }
+
+    const sanitizedUsername = sanitizeUsername(args.username);
     const existingUser = await ctx.db
       .query("users")
-      .withIndex("by_username", (q) => q.eq("username", args.username))
+      .withIndex("by_username", (q) => q.eq("username", sanitizedUsername))
       .unique();
 
     return existingUser === null;

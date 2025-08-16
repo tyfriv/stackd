@@ -66,7 +66,34 @@ export function validateVisibility(visibility: string): boolean {
 
 export function validateUsername(username: string): boolean {
   const sanitized = sanitizeUsername(username);
-  return sanitized.length >= 3 && sanitized.length <= 30 && /^[a-z0-9_-]+$/.test(sanitized);
+  
+  // SECURITY FIX: Enhanced username validation
+  if (sanitized.length < 3 || sanitized.length > 30) {
+    return false;
+  }
+  
+  // Must match pattern and not start/end with special chars
+  if (!/^[a-z0-9_-]+$/.test(sanitized)) {
+    return false;
+  }
+  
+  if (sanitized.startsWith('-') || sanitized.startsWith('_') || 
+      sanitized.endsWith('-') || sanitized.endsWith('_')) {
+    return false;
+  }
+  
+  // Prevent consecutive special characters
+  if (sanitized.includes('--') || sanitized.includes('__') || sanitized.includes('_-') || sanitized.includes('-_')) {
+    return false;
+  }
+  
+  // Reserved usernames
+  const reserved = ['admin', 'api', 'www', 'ftp', 'mail', 'support', 'help', 'stackd', 'root', 'user', 'guest'];
+  if (reserved.includes(sanitized)) {
+    return false;
+  }
+  
+  return true;
 }
 
 export function validateEmail(email: string): boolean {
@@ -108,9 +135,32 @@ export function validateDateRange(timestamp: number): boolean {
     return false;
   }
   
+  // SECURITY FIX: Prevent unrealistic dates
+  const year1970 = new Date('1970-01-01').getTime();
+  const year2050 = new Date('2050-01-01').getTime();
+  
+  if (timestamp < year1970 || timestamp > year2050) {
+    return false;
+  }
+  
   return timestamp >= oneYearAgo && timestamp <= oneDayForward;
 }
 
 export function validateReviewLength(review: string): boolean {
-  return review.length <= 5000 && review.trim().length >= 3;
+  if (typeof review !== 'string') return false;
+  const trimmed = review.trim();
+  return trimmed.length >= 3 && trimmed.length <= 5000;
+}
+
+// SECURITY FIX: Additional validation helpers
+export function validateMediaType(type: string): boolean {
+  return ["movie", "tv", "game", "music"].includes(type);
+}
+
+export function validateTargetType(type: string): boolean {
+  return ["log", "thread", "reply"].includes(type);
+}
+
+export function validateReactionType(type: string): boolean {
+  return ["like", "laugh", "angry"].includes(type);
 }

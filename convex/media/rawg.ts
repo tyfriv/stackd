@@ -86,8 +86,18 @@ export const searchGames = action({
   handler: async (ctx, args): Promise<MediaSearchResult[]> => {
     const { query, page = 1, pageSize = 20 } = args;
 
-    if (!query.trim()) {
+    // SECURITY FIX: Better input validation
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) {
       return [];
+    }
+    
+    if (trimmedQuery.length < 2) {
+      throw new Error("Search query must be at least 2 characters");
+    }
+    
+    if (trimmedQuery.length > 100) {
+      throw new Error("Search query too long");
     }
 
     // Rate limiting check
@@ -97,7 +107,7 @@ export const searchGames = action({
     // Note: searchCachedMedia is a public query, so we use api. not internal.
     const cachedResults = await ctx.runQuery(
       api.media.mediaQueries.searchCachedMedia,
-      { query: query.trim(), type: "game", limit: pageSize }
+      { query: trimmedQuery, type: "game", limit: pageSize }
     );
 
     // If we have enough cached results, return them
@@ -115,13 +125,13 @@ export const searchGames = action({
     try {
       const searchParams = new URLSearchParams({
         key: apiKey,
-        search: query.trim(),
+        search: trimmedQuery,
         page: page.toString(),
         page_size: Math.min(pageSize, 40).toString(), // RAWG allows up to 40 per page
         ordering: "-rating,-metacritic" // Order by rating and metacritic score
       });
 
-      console.log(`🎮 RAWG: Searching games for "${query}"`);
+      console.log(`🎮 RAWG: Searching games for "${trimmedQuery}"`);
       
       const response = await fetch(
         `https://api.rawg.io/api/games?${searchParams.toString()}`,
