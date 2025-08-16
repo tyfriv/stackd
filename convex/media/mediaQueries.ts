@@ -176,3 +176,49 @@ export const cleanExpiredCache = internalMutation({
     return expiredItems.length;
   },
 });
+
+// Add this mutation to your existing convex/media/mediaQueries.ts file
+
+import { mutation } from "../_generated/server";
+
+// Helper function to get or create media item from search result
+export const getOrCreateMediaFromSearch = mutation({
+  args: {
+    externalId: v.string(),
+    type: v.union(v.literal("movie"), v.literal("tv"), v.literal("game"), v.literal("music")),
+    title: v.string(),
+    releaseYear: v.number(),
+    posterUrl: v.string(),
+    description: v.optional(v.string()),
+    artist: v.optional(v.string()),
+    season: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    // First check if it exists
+    const existing = await ctx.db
+      .query("media")
+      .withIndex("by_external_id_type", (q) => 
+        q.eq("externalId", args.externalId).eq("type", args.type)
+      )
+      .unique();
+
+    if (existing) {
+      return existing;
+    }
+
+    // Create new media item
+    const mediaId = await ctx.db.insert("media", {
+      externalId: args.externalId,
+      type: args.type,
+      title: args.title,
+      releaseYear: args.releaseYear,
+      posterUrl: args.posterUrl,
+      description: args.description,
+      artist: args.artist,
+      season: args.season,
+      lastUpdated: Date.now(),
+    });
+
+    return await ctx.db.get(mediaId);
+  },
+});

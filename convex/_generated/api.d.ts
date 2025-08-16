@@ -14,6 +14,7 @@ import type {
   FunctionReference,
 } from "convex/server";
 import type * as lib_apiHelpers from "../lib/apiHelpers.js";
+import type * as logs_logOperations from "../logs/logOperations.js";
 import type * as media_mediaQueries from "../media/mediaQueries.js";
 import type * as media_rawg from "../media/rawg.js";
 import type * as media_spotify from "../media/spotify.js";
@@ -30,6 +31,7 @@ import type * as users from "../users.js";
  */
 declare const fullApi: ApiFromModules<{
   "lib/apiHelpers": typeof lib_apiHelpers;
+  "logs/logOperations": typeof logs_logOperations;
   "media/mediaQueries": typeof media_mediaQueries;
   "media/rawg": typeof media_rawg;
   "media/spotify": typeof media_spotify;
