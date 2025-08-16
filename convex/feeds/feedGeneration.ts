@@ -3,7 +3,18 @@ import { v } from "convex/values";
 import { mutation, query } from "../_generated/server";
 import { Id, Doc } from "../_generated/dataModel";
 
-// Get personalized feed for following users
+// Helper function for time filtering
+function getTimeFilter(timeRange: string): number {
+  const now = Date.now();
+  switch (timeRange) {
+    case "day": return now - (24 * 60 * 60 * 1000);
+    case "week": return now - (7 * 24 * 60 * 60 * 1000);
+    case "month": return now - (30 * 24 * 60 * 60 * 1000);
+    default: return 0;
+  }
+}
+
+// Get personalized feed for following users - OPTIMIZED
 export const getFollowingFeed = query({
   args: {
     paginationOpts: v.optional(v.object({
@@ -39,155 +50,124 @@ export const getFollowingFeed = query({
       return { page: [], isDone: true, continueCursor: null };
     }
 
-    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
-    const includeReviews = args.includeReviews ?? true;
-    const timeRange = args.timeRange || "all";
-
-    // Get users that current user is following
+    // Get following users efficiently using existing index
     const following = await ctx.db
       .query("follows")
       .withIndex("by_follower", (q) => q.eq("followerId", currentUser._id))
       .collect();
 
-    const followingIds = following.map(f => f.followingId);
-    
-    // If not following anyone, return empty feed
-    if (followingIds.length === 0) {
+    const followingIds = new Set(following.map(f => f.followingId));
+    if (followingIds.size === 0) {
       return { page: [], isDone: true, continueCursor: null };
     }
 
-    // Calculate time filter
-    let timeFilter = 0;
-    const now = Date.now();
-    switch (timeRange) {
-      case "day":
-        timeFilter = now - (24 * 60 * 60 * 1000);
-        break;
-      case "week":
-        timeFilter = now - (7 * 24 * 60 * 60 * 1000);
-        break;
-      case "month":
-        timeFilter = now - (30 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        timeFilter = 0;
-    }
+    const timeFilter = getTimeFilter(args.timeRange || "all");
+    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
 
-    // Get public logs from followed users - we need to filter after querying
-    // since Convex doesn't support complex WHERE clauses with multiple conditions
-    let allPublicLogs = await ctx.db
-      .query("logs")
-      .withIndex("by_visibility_logged_at", (q) => 
-        q.eq("visibility", "public")
-      )
-      .order("desc")
-      .collect();
+    // OPTIMIZATION: Get logs efficiently using existing indexes with reasonable limits
+    const [publicLogs, followersLogs] = await Promise.all([
+      timeFilter === 0 
+        ? ctx.db.query("logs").withIndex("by_visibility", (q) => q.eq("visibility", "public")).order("desc").take(300)
+        : ctx.db.query("logs").withIndex("by_visibility_logged_at", (q) => q.eq("visibility", "public"))
+            .filter((q) => q.gte(q.field("loggedAt"), timeFilter)).order("desc").take(300),
+      
+      ctx.db.query("logs").withIndex("by_visibility", (q) => q.eq("visibility", "followers")).collect()
+    ]);
 
-    // Also get followers-only logs that current user can see
-    const followersLogs = await ctx.db
-      .query("logs")
-      .withIndex("by_visibility", (q) => 
-        q.eq("visibility", "followers")
-      )
-      .collect();
-
-    // Combine and filter
-    const allLogs = [...allPublicLogs, ...followersLogs];
-    const followingSet = new Set(followingIds);
+    // Filter for following users only (in memory - this is the tradeoff)
+    const allLogs = [...publicLogs, ...followersLogs].filter(log => followingIds.has(log.userId));
     
-    let filteredLogs = allLogs.filter(log => {
-      // Must be from a followed user
-      if (!followingSet.has(log.userId)) return false;
-      
-      // Apply time filter
-      if (timeRange !== "all" && log.loggedAt < timeFilter) return false;
-      
-      // Filter reviews if specified
-      if (!includeReviews && log.review && log.review.trim().length > 0) return false;
-      
-      return true;
-    });
+    // OPTIMIZATION: Batch media filtering
+    let filteredLogs = allLogs;
+    if (args.mediaTypes?.length) {
+      const mediaIds = [...new Set(allLogs.map(log => log.mediaId))];
+      const medias = await Promise.all(mediaIds.map(id => ctx.db.get(id)));
+      const mediaMap = new Map<Id<"media">, Doc<"media">>();
+      medias.forEach((media, i) => {
+        if (media) mediaMap.set(mediaIds[i], media);
+      });
 
-    // Filter by media type if specified
-    if (args.mediaTypes && args.mediaTypes.length > 0) {
-      const mediaTypeSet = new Set(args.mediaTypes);
-      const filteredByMedia = [];
-      
-      for (const log of filteredLogs) {
-        const media = await ctx.db.get(log.mediaId);
-        if (media && mediaTypeSet.has(media.type)) {
-          filteredByMedia.push(log);
-        }
-      }
-      filteredLogs = filteredByMedia;
+      filteredLogs = allLogs.filter(log => {
+        const media = mediaMap.get(log.mediaId);
+        return media && args.mediaTypes!.includes(media.type);
+      });
     }
 
-    // Sort by loggedAt desc
-    filteredLogs.sort((a, b) => b.loggedAt - a.loggedAt);
+    // Apply review filter
+    if (!args.includeReviews) {
+      filteredLogs = filteredLogs.filter(log => !log.review?.trim().length);
+    }
 
-    // Apply pagination manually
-    const startIndex = args.paginationOpts?.cursor ? 
-      parseInt(args.paginationOpts.cursor) : 0;
+    // Sort and paginate
+    filteredLogs.sort((a, b) => b.loggedAt - a.loggedAt);
+    
+    const startIndex = paginationOpts.cursor ? parseInt(paginationOpts.cursor) : 0;
     const endIndex = startIndex + paginationOpts.numItems;
     const pageItems = filteredLogs.slice(startIndex, endIndex);
-    const hasMore = endIndex < filteredLogs.length;
 
-    // Enrich with user and media details
-    const enrichedFeed = await Promise.all(
-      pageItems.map(async (log) => {
-        const [user, media] = await Promise.all([
-          ctx.db.get(log.userId),
-          ctx.db.get(log.mediaId),
-        ]);
+    // OPTIMIZATION: Batch ALL enrichment data efficiently
+    const userIds = [...new Set(pageItems.map(log => log.userId))];
+    const mediaIds = [...new Set(pageItems.map(log => log.mediaId))];
+    const logIds = pageItems.map(log => log._id);
 
-        // Get reaction counts for this log
-        const reactions = await ctx.db
-          .query("reactions")
-          .withIndex("by_target", (q) => 
-            q.eq("targetType", "log").eq("targetId", log._id)
-          )
-          .collect();
-
-        const reactionCounts = reactions.reduce((acc, reaction) => {
-          acc[reaction.reactionType] = (acc[reaction.reactionType] || 0) + 1;
-          return acc;
-        }, {} as Record<string, number>);
-
-        // Check if current user has reacted
-        const userReaction = reactions.find(r => r.userId === currentUser._id);
-
-        // Get comment count
-        const commentCount = await ctx.db
-          .query("reviewComments")
-          .withIndex("by_log", (q) => q.eq("logId", log._id))
+    const [users, medias, reactions, comments] = await Promise.all([
+      Promise.all(userIds.map(id => ctx.db.get(id))),
+      Promise.all(mediaIds.map(id => ctx.db.get(id))),
+      Promise.all(logIds.map(logId => 
+        ctx.db.query("reactions")
+          .withIndex("by_target", (q) => q.eq("targetType", "log").eq("targetId", logId))
           .collect()
-          .then(comments => comments.length);
+      )),
+      Promise.all(logIds.map(logId => 
+        ctx.db.query("reviewComments")
+          .withIndex("by_log", (q) => q.eq("logId", logId))
+          .collect()
+          .then(c => c.length)
+      )),
+    ]);
 
-        return {
-          type: "log" as const,
-          log,
-          user,
-          media,
-          reactions: reactionCounts,
-          userReaction: userReaction?.reactionType || null,
-          commentCount,
-          timestamp: log.loggedAt,
-        };
-      })
-    );
+    // Build lookup maps
+    const userMap = new Map<Id<"users">, Doc<"users">>();
+    const mediaMap = new Map<Id<"media">, Doc<"media">>();
+    users.forEach((user, i) => user && userMap.set(userIds[i], user));
+    medias.forEach((media, i) => media && mediaMap.set(mediaIds[i], media));
 
-    // Filter out any items where user or media couldn't be found
-    const validFeedItems = enrichedFeed.filter(item => item.user && item.media);
+    // Build enriched results
+    const enrichedFeed = pageItems.map((log, i) => {
+      const user = userMap.get(log.userId);
+      const media = mediaMap.get(log.mediaId);
+      const logReactions = reactions[i];
+
+      if (!user || !media) return null;
+
+      const reactionCounts = logReactions.reduce((acc: Record<string, number>, reaction) => {
+        acc[reaction.reactionType] = (acc[reaction.reactionType] || 0) + 1;
+        return acc;
+      }, {});
+
+      const userReaction = logReactions.find(r => r.userId === currentUser._id);
+
+      return {
+        type: "log" as const,
+        log,
+        user,
+        media,
+        reactions: reactionCounts,
+        userReaction: userReaction?.reactionType || null,
+        commentCount: comments[i],
+        timestamp: log.loggedAt,
+      };
+    }).filter(Boolean);
 
     return {
-      page: validFeedItems,
-      isDone: !hasMore,
-      continueCursor: hasMore ? endIndex.toString() : null,
+      page: enrichedFeed,
+      isDone: endIndex >= filteredLogs.length,
+      continueCursor: endIndex < filteredLogs.length ? endIndex.toString() : null,
     };
   },
 });
 
-// Get global/discover feed for all users
+// Get global/discover feed for all users - OPTIMIZED
 export const getGlobalFeed = query({
   args: {
     paginationOpts: v.optional(v.object({
@@ -215,7 +195,11 @@ export const getGlobalFeed = query({
   },
   handler: async (ctx, args) => {
     const identity = await ctx.auth.getUserIdentity();
-    
+    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
+    const timeRange = args.timeRange || "week";
+    const sortBy = args.sortBy || "recent";
+
+    // Get current user and blocked relationships
     let currentUser: Doc<"users"> | null = null;
     let blockedUserIds = new Set<Id<"users">>();
     let blockerIds = new Set<Id<"users">>();
@@ -227,190 +211,176 @@ export const getGlobalFeed = query({
         .unique();
 
       if (currentUser) {
-        // Get blocked relationships to filter out - currentUser is guaranteed non-null here
+        // Batch blocked user queries - currentUser is guaranteed non-null here
         const userId = currentUser._id;
         const [blockedByMe, blockedMe] = await Promise.all([
-          ctx.db
-            .query("blocks")
-            .withIndex("by_blocker", (q) => q.eq("blockerId", userId))
-            .collect(),
-          ctx.db
-            .query("blocks")
-            .withIndex("by_blocked", (q) => q.eq("blockedId", userId))
-            .collect(),
+          ctx.db.query("blocks").withIndex("by_blocker", (q) => q.eq("blockerId", userId)).collect(),
+          ctx.db.query("blocks").withIndex("by_blocked", (q) => q.eq("blockedId", userId)).collect(),
         ]);
-
         blockedUserIds = new Set(blockedByMe.map(b => b.blockedId));
         blockerIds = new Set(blockedMe.map(b => b.blockerId));
       }
     }
 
-    const paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
-    const includeReviews = args.includeReviews ?? true;
-    const timeRange = args.timeRange || "week"; // Default to week for global feed
-    const sortBy = args.sortBy || "recent";
-
     // Calculate time filter
-    let timeFilter = 0;
-    const now = Date.now();
-    switch (timeRange) {
-      case "day":
-        timeFilter = now - (24 * 60 * 60 * 1000);
-        break;
-      case "week":
-        timeFilter = now - (7 * 24 * 60 * 60 * 1000);
-        break;
-      case "month":
-        timeFilter = now - (30 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        timeFilter = 0;
+    const timeFilter = getTimeFilter(timeRange);
+
+    // OPTIMIZATION: Use existing indexes with reasonable limits
+    let logs: Doc<"logs">[];
+    
+    if (timeRange === "all") {
+      logs = await ctx.db
+        .query("logs")
+        .withIndex("by_visibility", (q) => q.eq("visibility", "public"))
+        .order("desc")
+        .take(400); // Reasonable limit for processing
+    } else {
+      logs = await ctx.db
+        .query("logs")
+        .withIndex("by_visibility_logged_at", (q) => q.eq("visibility", "public"))
+        .filter((q) => q.gte(q.field("loggedAt"), timeFilter))
+        .order("desc")
+        .take(400);
     }
 
-    // Get public logs
-    const allPublicLogs = await ctx.db
-      .query("logs")
-      .withIndex("by_visibility_logged_at", (q) => 
-        q.eq("visibility", "public")
-      )
-      .order("desc")
-      .collect();
+    // OPTIMIZATION: Batch media lookups and create lookup map
+    const uniqueMediaIds = [...new Set(logs.map(log => log.mediaId))];
+    const mediaLookups = await Promise.all(
+      uniqueMediaIds.map(id => ctx.db.get(id))
+    );
+    const mediaMap = new Map<Id<"media">, Doc<"media">>();
+    mediaLookups.forEach((media, i) => {
+      if (media) mediaMap.set(uniqueMediaIds[i], media);
+    });
 
-    // Filter logs based on criteria
-    let filteredLogs = allPublicLogs.filter(log => {
-      // Skip blocked users
-      if (blockedUserIds.has(log.userId) || blockerIds.has(log.userId)) {
-        return false;
+    // Apply filters efficiently
+    let filteredLogs = logs.filter(log => {
+      // Block filter
+      if (blockedUserIds.has(log.userId) || blockerIds.has(log.userId)) return false;
+      
+      // Review filter
+      if (!args.includeReviews && log.review?.trim().length) return false;
+      
+      // Media type filter using pre-loaded media map
+      if (args.mediaTypes?.length) {
+        const media = mediaMap.get(log.mediaId);
+        if (!media || !args.mediaTypes.includes(media.type)) return false;
       }
-
-      // Apply time filter
-      if (timeRange !== "all" && log.loggedAt < timeFilter) {
-        return false;
-      }
-
-      // Filter reviews if specified
-      if (!includeReviews && log.review && log.review.trim().length > 0) {
-        return false;
-      }
-
+      
       return true;
     });
 
-    // Filter by media type if specified
-    if (args.mediaTypes && args.mediaTypes.length > 0) {
-      const mediaTypeSet = new Set(args.mediaTypes);
-      const filteredByMedia = [];
+    // OPTIMIZATION: Batch engagement data for sorting (if not "recent")
+    if (sortBy !== "recent") {
+      const logEngagementPromises = filteredLogs.map(async (log) => {
+        const [reactions, commentCount] = await Promise.all([
+          ctx.db
+            .query("reactions")
+            .withIndex("by_target", (q) => q.eq("targetType", "log").eq("targetId", log._id))
+            .collect(),
+          ctx.db
+            .query("reviewComments")
+            .withIndex("by_log", (q) => q.eq("logId", log._id))
+            .collect()
+            .then(comments => comments.length),
+        ]);
+
+        // Calculate engagement score with freshness decay
+        const ageInHours = (Date.now() - log.loggedAt) / (1000 * 60 * 60);
+        const freshnessMultiplier = Math.max(0.1, 1 / (1 + ageInHours / 24));
+        
+        const engagementScore = sortBy === "popular" 
+          ? (reactions.length * 2 + commentCount * 3) * freshnessMultiplier
+          : (commentCount * 5 + reactions.length) * freshnessMultiplier;
+
+        return { log, engagementScore };
+      });
+
+      const logsWithEngagement = await Promise.all(logEngagementPromises);
       
-      for (const log of filteredLogs) {
-        const media = await ctx.db.get(log.mediaId);
-        if (media && mediaTypeSet.has(media.type)) {
-          filteredByMedia.push(log);
-        }
-      }
-      filteredLogs = filteredByMedia;
-    }
-
-    // Sort based on sortBy parameter
-    if (sortBy === "recent") {
-      filteredLogs.sort((a, b) => b.loggedAt - a.loggedAt);
-    } else if (sortBy === "popular" || sortBy === "discussed") {
-      // For popular/discussed, we need to get engagement metrics
-      const logsWithEngagement = await Promise.all(
-        filteredLogs.map(async (log) => {
-          const [reactions, comments] = await Promise.all([
-            ctx.db
-              .query("reactions")
-              .withIndex("by_target", (q) => 
-                q.eq("targetType", "log").eq("targetId", log._id)
-              )
-              .collect(),
-            ctx.db
-              .query("reviewComments")
-              .withIndex("by_log", (q) => q.eq("logId", log._id))
-              .collect(),
-          ]);
-
-          const engagementScore = sortBy === "popular" 
-            ? reactions.length * 2 + comments.length * 3 // Weight comments higher for popularity
-            : comments.length * 5 + reactions.length; // Weight comments much higher for discussion
-
-          return {
-            log,
-            engagementScore,
-          };
-        })
-      );
-
       filteredLogs = logsWithEngagement
         .sort((a, b) => {
-          // Primary sort by engagement, secondary by recency
           if (a.engagementScore === b.engagementScore) {
-            return b.log.loggedAt - a.log.loggedAt;
+            return b.log.loggedAt - a.log.loggedAt; // Fallback to recency
           }
           return b.engagementScore - a.engagementScore;
         })
         .map(item => item.log);
+    } else {
+      // For "recent", just sort by loggedAt (already sorted from query)
     }
 
     // Apply pagination
-    const startIndex = args.paginationOpts?.cursor ? 
-      parseInt(args.paginationOpts.cursor) : 0;
+    const startIndex = paginationOpts.cursor ? parseInt(paginationOpts.cursor) : 0;
     const endIndex = startIndex + paginationOpts.numItems;
     const pageItems = filteredLogs.slice(startIndex, endIndex);
-    const hasMore = endIndex < filteredLogs.length;
 
-    // Enrich with user and media details
-    const enrichedFeed = await Promise.all(
-      pageItems.map(async (log) => {
-        const [user, media] = await Promise.all([
-          ctx.db.get(log.userId),
-          ctx.db.get(log.mediaId),
-        ]);
-
-        // Get reaction counts and user's reaction
-        const reactions = await ctx.db
+    // OPTIMIZATION: Batch ALL enrichment data
+    const uniqueUserIds = [...new Set(pageItems.map(log => log.userId))];
+    const pageLogIds = pageItems.map(log => log._id);
+    
+    const [users, reactions, comments] = await Promise.all([
+      // Batch user lookups
+      Promise.all(uniqueUserIds.map(id => ctx.db.get(id))),
+      
+      // Batch reaction lookups for displayed logs only
+      Promise.all(pageLogIds.map(logId => 
+        ctx.db
           .query("reactions")
-          .withIndex("by_target", (q) => 
-            q.eq("targetType", "log").eq("targetId", log._id)
-          )
-          .collect();
-
-        const reactionCounts = reactions.reduce((acc, reaction) => {
-          acc[reaction.reactionType] = (acc[reaction.reactionType] || 0) + 1;
-          return acc;
-        }, {} as Record<string, number>);
-
-        const userReaction = currentUser 
-          ? reactions.find(r => r.userId === currentUser._id)
-          : null;
-
-        // Get comment count
-        const commentCount = await ctx.db
-          .query("reviewComments")
-          .withIndex("by_log", (q) => q.eq("logId", log._id))
+          .withIndex("by_target", (q) => q.eq("targetType", "log").eq("targetId", logId))
           .collect()
-          .then(comments => comments.length);
+      )),
+      
+      // Batch comment counts for displayed logs only  
+      Promise.all(pageLogIds.map(logId => 
+        ctx.db
+          .query("reviewComments")
+          .withIndex("by_log", (q) => q.eq("logId", logId))
+          .collect()
+          .then(comments => comments.length)
+      )),
+    ]);
 
-        return {
-          type: "log" as const,
-          log,
-          user,
-          media,
-          reactions: reactionCounts,
-          userReaction: userReaction?.reactionType || null,
-          commentCount,
-          timestamp: log.loggedAt,
-        };
-      })
-    );
+    // Create user lookup map
+    const userMap = new Map<Id<"users">, Doc<"users">>();
+    users.forEach((user, i) => {
+      if (user) userMap.set(uniqueUserIds[i], user);
+    });
 
-    // Filter out any items where user or media couldn't be found
-    const validFeedItems = enrichedFeed.filter(item => item.user && item.media);
+    // Build enriched feed items
+    const enrichedFeed = pageItems.map((log, i) => {
+      const user = userMap.get(log.userId);
+      const media = mediaMap.get(log.mediaId);
+      const logReactions = reactions[i];
+      const commentCount = comments[i];
+
+      if (!user || !media) return null;
+
+      const reactionCounts = logReactions.reduce((acc, reaction) => {
+        acc[reaction.reactionType] = (acc[reaction.reactionType] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+
+      const userReaction = currentUser 
+        ? logReactions.find(r => r.userId === currentUser._id)
+        : null;
+
+      return {
+        type: "log" as const,
+        log,
+        user,
+        media,
+        reactions: reactionCounts,
+        userReaction: userReaction?.reactionType || null,
+        commentCount,
+        timestamp: log.loggedAt,
+      };
+    }).filter((item): item is NonNullable<typeof item> => item !== null);
 
     return {
-      page: validFeedItems,
-      isDone: !hasMore,
-      continueCursor: hasMore ? endIndex.toString() : null,
+      page: enrichedFeed,
+      isDone: endIndex >= filteredLogs.length,
+      continueCursor: endIndex < filteredLogs.length ? endIndex.toString() : null,
     };
   },
 });
@@ -436,12 +406,7 @@ export const getTrendingMedia = query({
     const limit = args.limit || 10;
 
     // Calculate time filter
-    const now = Date.now();
-    const timeFilter = timeRange === "day" 
-      ? now - (24 * 60 * 60 * 1000)
-      : timeRange === "week"
-      ? now - (7 * 24 * 60 * 60 * 1000)
-      : now - (30 * 24 * 60 * 60 * 1000);
+    const timeFilter = getTimeFilter(timeRange);
 
     // Get recent public logs
     const recentLogs = await ctx.db

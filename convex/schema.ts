@@ -17,7 +17,8 @@ export default defineSchema({
     topMusic: v.array(v.string()),
   })
     .index("by_clerk_id", ["clerkId"])
-    .index("by_username", ["username"]),
+    .index("by_username", ["username"])
+    .searchIndex("search_username", { searchField: "username" }),
 
   // Media items - cached from APIs
   media: defineTable({
