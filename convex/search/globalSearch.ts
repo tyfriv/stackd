@@ -1,7 +1,45 @@
-// convex/search/globalSearch.ts
+// convex/search/globalSearch.ts - Fixed version
 import { v } from "convex/values";
 import { query, action } from "../_generated/server";
 import { api, internal } from "../_generated/api";
+
+// Type definitions
+interface LocalSearchResult {
+  _id: string;
+  externalId?: string;
+  username?: string;
+  profileImage?: string;
+  bio?: string;
+  title?: string;
+  releaseYear?: number;
+  posterUrl?: string;
+  artist?: string;
+  season?: number;
+  description?: string;
+  type: "user" | "movie" | "tv" | "game" | "music";
+}
+
+interface SearchResults {
+  users: LocalSearchResult[];
+  movies: LocalSearchResult[];
+  tv: LocalSearchResult[];
+  games: LocalSearchResult[];
+  music: LocalSearchResult[];
+  totalResults: number;
+  isFromCache?: boolean;
+}
+
+interface ExternalSearchResult {
+  _id: string;
+  externalId: string;
+  title: string;
+  releaseYear: number;
+  posterUrl: string;
+  description?: string;
+  artist?: string;
+  season?: number;
+  type: "movie" | "tv" | "game" | "music";
+}
 
 /**
  * Global search across users and media content
@@ -19,7 +57,7 @@ export const globalSearch = query({
     )),
     limit: v.optional(v.number())
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<SearchResults> => {
     const { query, type = "all", limit = 50 } = args;
     
     if (!query.trim()) {
@@ -34,7 +72,7 @@ export const globalSearch = query({
     }
 
     const searchTerm = query.trim().toLowerCase();
-    const results: any = {
+    const results: SearchResults = {
       users: [],
       movies: [],
       tv: [],
@@ -51,7 +89,6 @@ export const globalSearch = query({
         .filter((q) => 
           q.or(
             q.eq(q.field("username"), searchTerm),
-            // Simple contains search - you might want to add a search index later
             q.gte(q.field("username"), searchTerm)
           )
         )
@@ -74,7 +111,7 @@ export const globalSearch = query({
       : [type as "movies" | "tv" | "games" | "music"];
 
     for (const mediaType of mediaTypes) {
-      if (type === "users") continue; // Skip media if only searching users
+      if (type === "users") continue;
       
       const dbType = mediaType === "movies" ? "movie" 
                    : mediaType === "tv" ? "tv"
@@ -95,23 +132,42 @@ export const globalSearch = query({
         posterUrl: media.posterUrl,
         artist: media.artist,
         season: media.season,
-        type: mediaType,
+        type: dbType,
         description: media.description
       }));
     }
 
-    // Calculate total results
     results.totalResults = Object.values(results)
-      .filter(arr => Array.isArray(arr))
-      .reduce((total: number, arr: any[]) => total + arr.length, 0);
+      .filter((arr): arr is LocalSearchResult[] => Array.isArray(arr))
+      .reduce((total: number, arr: LocalSearchResult[]) => total + arr.length, 0);
 
     return results;
   }
 });
 
 /**
- * Search with external API integration for new content
- * This would integrate with your existing TMDB/RAWG/Spotify actions
+ * Helper function to merge local and external results without duplicates
+ */
+function mergeResults(local: LocalSearchResult[], external: ExternalSearchResult[], maxResults = 20): LocalSearchResult[] {
+  const combined: LocalSearchResult[] = [...local];
+  
+  for (const externalItem of external) {
+    const exists = combined.some(localItem => 
+      localItem.externalId === externalItem.externalId ||
+      (localItem.title === externalItem.title && localItem.releaseYear === externalItem.releaseYear)
+    );
+    
+    if (!exists && combined.length < maxResults) {
+      combined.push(externalItem);
+    }
+  }
+  
+  return combined.slice(0, maxResults);
+}
+
+/**
+ * MAIN SEARCH ACTION - This is what your frontend should call
+ * Searches local cache first, then hits external APIs if needed
  */
 export const searchWithAPIs = action({
   args: { 
@@ -125,70 +181,146 @@ export const searchWithAPIs = action({
     )),
     includeExternal: v.optional(v.boolean())
   },
-  handler: async (ctx, args): Promise<{
-    users: any[];
-    movies: any[];
-    tv: any[];
-    games: any[];
-    music: any[];
-    totalResults: number;
-    isFromCache: boolean;
-  }> => {
+  handler: async (ctx, args): Promise<SearchResults & { isFromCache: boolean }> => {
     const { query, type = "all", includeExternal = true } = args;
     
-    // First get local cached results with explicit type annotation
-    const localResults: {
-      users: any[];
-      movies: any[];
-      tv: any[];
-      games: any[];
-      music: any[];
-      totalResults: number;
-    } = await ctx.runQuery(api.search.globalSearch.globalSearch, {
+    // Track this search
+    await ctx.runMutation(internal.search.searchHelpers.trackSearch, {
+      query,
+      resultCount: 0,
+      searchType: type
+    });
+
+    // First get local cached results with explicit typing
+    const localResults: SearchResults = await ctx.runQuery(api.search.globalSearch.globalSearch, {
       query,
       type,
       limit: 20
     });
 
     // If we have enough local results or not including external, return local only
-    if (!includeExternal || localResults.totalResults >= 20) {
+    if (!includeExternal || localResults.totalResults >= 10) {
       return {
         ...localResults,
         isFromCache: true
       };
     }
 
-    // TODO: Integrate with your existing API actions
-    // You would call your existing TMDB/RAWG/Spotify search actions here
-    // Example:
-    // if (type === "all" || type === "movies") {
-    //   const tmdbResults = await ctx.runAction(api.tmdb.searchMovies, { query });
-    //   // Process and merge results
-    // }
-
-    const externalResults = {
-      movies: [] as any[],
-      tv: [] as any[],
-      games: [] as any[],
-      music: [] as any[]
+    // Now search external APIs for missing results
+    const externalResults: {
+      movies: ExternalSearchResult[];
+      tv: ExternalSearchResult[];
+      games: ExternalSearchResult[];
+      music: ExternalSearchResult[];
+    } = {
+      movies: [],
+      tv: [],
+      games: [],
+      music: []
     };
 
-    // Merge local and external results
-    const mergedResults = {
+    try {
+      // Search movies via TMDB if needed
+      if ((type === "all" || type === "movies") && localResults.movies.length < 5) {
+        console.log("🔍 Searching TMDB for movies:", query);
+        const tmdbMovies = await ctx.runAction(api.media.tmdb.searchMovies, { 
+          query, 
+          page: 1 
+        });
+        
+        externalResults.movies = tmdbMovies.slice(0, 10).map(movie => ({
+          _id: movie.externalId,
+          externalId: movie.externalId,
+          title: movie.title,
+          releaseYear: movie.releaseYear,
+          posterUrl: movie.posterUrl,
+          description: movie.description,
+          type: "movie" as const
+        }));
+      }
+
+      // Search TV shows via TMDB if needed
+      if ((type === "all" || type === "tv") && localResults.tv.length < 5) {
+        console.log("🔍 Searching TMDB for TV shows:", query);
+        const tmdbTV = await ctx.runAction(api.media.tmdb.searchTVShows, { 
+          query, 
+          page: 1 
+        });
+        
+        externalResults.tv = tmdbTV.slice(0, 10).map(show => ({
+          _id: show.externalId,
+          externalId: show.externalId,
+          title: show.title,
+          releaseYear: show.releaseYear,
+          posterUrl: show.posterUrl,
+          description: show.description,
+          season: show.season,
+          type: "tv" as const
+        }));
+      }
+
+      // Search games via RAWG if needed
+      if ((type === "all" || type === "games") && localResults.games.length < 5) {
+        console.log("🔍 Searching RAWG for games:", query);
+        const rawgGames = await ctx.runAction(api.media.rawg.searchGames, { 
+          query, 
+          pageSize: 10 
+        });
+        
+        externalResults.games = rawgGames.slice(0, 10).map(game => ({
+          _id: game.externalId,
+          externalId: game.externalId,
+          title: game.title,
+          releaseYear: game.releaseYear,
+          posterUrl: game.posterUrl,
+          description: game.description,
+          type: "game" as const
+        }));
+      }
+
+      // Search music via Spotify if needed
+      if ((type === "all" || type === "music") && localResults.music.length < 5) {
+        console.log("🔍 Searching Spotify for music:", query);
+        const spotifyMusic = await ctx.runAction(api.media.spotify.searchMusic, { 
+          query, 
+          limit: 10 
+        });
+        
+        externalResults.music = spotifyMusic.slice(0, 10).map(track => ({
+          _id: track.externalId,
+          externalId: track.externalId,
+          title: track.title,
+          releaseYear: track.releaseYear,
+          posterUrl: track.posterUrl,
+          description: track.description,
+          artist: track.artist,
+          type: "music" as const
+        }));
+      }
+
+    } catch (error) {
+      console.error("🔍 External API search error:", error);
+      // Continue with local results even if external APIs fail
+    }
+
+    // Merge local and external results, avoiding duplicates
+    const mergedResults: SearchResults = {
       users: localResults.users,
-      movies: [...localResults.movies, ...externalResults.movies].slice(0, 20),
-      tv: [...localResults.tv, ...externalResults.tv].slice(0, 20),
-      games: [...localResults.games, ...externalResults.games].slice(0, 20),
-      music: [...localResults.music, ...externalResults.music].slice(0, 20),
-      totalResults: 0,
-      isFromCache: localResults.totalResults === 0 ? false : true
+      movies: mergeResults(localResults.movies, externalResults.movies),
+      tv: mergeResults(localResults.tv, externalResults.tv),
+      games: mergeResults(localResults.games, externalResults.games),
+      music: mergeResults(localResults.music, externalResults.music),
+      totalResults: 0
     };
 
     mergedResults.totalResults = Object.values(mergedResults)
-      .filter(arr => Array.isArray(arr))
-      .reduce((total: number, arr: any[]) => total + arr.length, 0);
+      .filter((arr): arr is LocalSearchResult[] => Array.isArray(arr))
+      .reduce((total: number, arr: LocalSearchResult[]) => total + arr.length, 0);
 
-    return mergedResults;
+    return {
+      ...mergedResults,
+      isFromCache: false
+    };
   }
 });
 
@@ -254,7 +386,7 @@ export const getTrendingContent = query({
         q.eq("visibility", "public")
       )
       .order("desc")
-      .take(100); // Get more to have a good sample
+      .take(100);
 
     // Group by media and count occurrences
     const mediaCount = recentLogs.reduce((acc, log) => {
@@ -288,11 +420,10 @@ export const getTrendingContent = query({
  */
 export const quickMediaSearch = query({
   args: { mediaId: v.id("media") },
-  handler: async (ctx, args): Promise<any> => {
+  handler: async (ctx, args) => {
     const media = await ctx.db.get(args.mediaId);
     if (!media) return null;
 
-    // Get basic stats with explicit type annotation
     const stats: {
       totalLogs: number;
       totalReviews: number;
@@ -331,7 +462,6 @@ export const searchMediaByType = query({
     if (sortBy === "year") {
       results.sort((a, b) => b.releaseYear - a.releaseYear);
     } else if (sortBy === "popularity") {
-      // Would need to add popularity metrics - for now just use recent activity
       results.sort((a, b) => b.lastUpdated - a.lastUpdated);
     }
 
@@ -346,5 +476,329 @@ export const searchMediaByType = query({
       type: mediaType,
       description: media.description
     }));
+  }
+});
+
+/**
+ * ADVANCED SEARCH ACTION with filters
+ * Supports year range, sorting, and popularity filtering
+ */
+export const advancedSearchWithAPIs = action({
+  args: { 
+    query: v.string(),
+    type: v.optional(v.union(
+      v.literal("all"),
+      v.literal("movies"),
+      v.literal("tv"), 
+      v.literal("games"),
+      v.literal("music")
+    )),
+    filters: v.optional(v.object({
+      yearStart: v.optional(v.number()),
+      yearEnd: v.optional(v.number()),
+      sortBy: v.optional(v.union(
+        v.literal("relevance"),
+        v.literal("year_desc"),
+        v.literal("year_asc"),
+        v.literal("popularity"),
+        v.literal("rating")
+      )),
+      popularOnly: v.optional(v.boolean()),
+      limit: v.optional(v.number())
+    })),
+    includeExternal: v.optional(v.boolean())
+  },
+  handler: async (ctx, args): Promise<SearchResults & { isFromCache: boolean }> => {
+    const { 
+      query, 
+      type = "all", 
+      filters = {}, 
+      includeExternal = true 
+    } = args;
+    
+    const {
+      yearStart,
+      yearEnd,
+      sortBy = "relevance",
+      popularOnly = false,
+      limit = 20
+    } = filters;
+
+    // Track this advanced search
+    await ctx.runMutation(internal.search.searchHelpers.trackSearch, {
+      query,
+      resultCount: 0,
+      searchType: `advanced_${type}_${sortBy}`
+    });
+
+    // First get local cached results with filters applied
+    const localResults: SearchResults = await ctx.runQuery(api.search.globalSearch.globalSearch, {
+      query,
+      type,
+      limit: Math.floor(limit * 0.7) // Reserve 30% for external results
+    });
+
+    // Apply year filters to local results
+    if (yearStart || yearEnd) {
+      const filterByYear = (items: LocalSearchResult[]) => 
+        items.filter(item => {
+          if (!item.releaseYear) return true; // Keep items without year data
+          if (yearStart && item.releaseYear < yearStart) return false;
+          if (yearEnd && item.releaseYear > yearEnd) return false;
+          return true;
+        });
+
+      localResults.movies = filterByYear(localResults.movies);
+      localResults.tv = filterByYear(localResults.tv);
+      localResults.games = filterByYear(localResults.games);
+      localResults.music = filterByYear(localResults.music);
+      
+      // Recalculate total
+      localResults.totalResults = Object.values(localResults)
+        .filter((arr): arr is LocalSearchResult[] => Array.isArray(arr))
+        .reduce((total, arr) => total + arr.length, 0);
+    }
+
+    // Apply popularity filter if requested
+    if (popularOnly) {
+      // Get popular media IDs from recent logs
+      const recentLogs = await ctx.runQuery(internal.search.searchHelpers.getPopularSearches, {
+        limit: 100
+      });
+      
+      const popularTitles = new Set(recentLogs.map(title => title?.toLowerCase()));
+      
+      const filterByPopularity = (items: LocalSearchResult[]) => 
+        items.filter(item => 
+          item.title && popularTitles.has(item.title.toLowerCase())
+        );
+
+      if (popularTitles.size > 0) {
+        localResults.movies = filterByPopularity(localResults.movies);
+        localResults.tv = filterByPopularity(localResults.tv);
+        localResults.games = filterByPopularity(localResults.games);
+        localResults.music = filterByPopularity(localResults.music);
+        
+        // Recalculate total
+        localResults.totalResults = Object.values(localResults)
+          .filter((arr): arr is LocalSearchResult[] => Array.isArray(arr))
+          .reduce((total, arr) => total + arr.length, 0);
+      }
+    }
+
+    // Apply sorting to local results
+    const applySorting = (items: LocalSearchResult[]) => {
+      const sortedItems = [...items];
+      
+      switch (sortBy) {
+        case "year_desc":
+          return sortedItems.sort((a, b) => (b.releaseYear || 0) - (a.releaseYear || 0));
+        case "year_asc":
+          return sortedItems.sort((a, b) => (a.releaseYear || 0) - (b.releaseYear || 0));
+        case "popularity":
+          // Sort by recency in cache as a proxy for popularity
+          return sortedItems; // Already sorted by relevance from search
+        case "rating":
+          // Would need rating data in cache - for now use relevance
+          return sortedItems;
+        case "relevance":
+        default:
+          return sortedItems; // Already sorted by search relevance
+      }
+    };
+
+    localResults.movies = applySorting(localResults.movies);
+    localResults.tv = applySorting(localResults.tv);
+    localResults.games = applySorting(localResults.games);
+    localResults.music = applySorting(localResults.music);
+
+    // If we have enough local results or not including external, return local only
+    if (!includeExternal || localResults.totalResults >= Math.floor(limit * 0.8)) {
+      return {
+        ...localResults,
+        isFromCache: true
+      };
+    }
+
+    // Search external APIs with advanced parameters
+    const externalResults = {
+      movies: [] as ExternalSearchResult[],
+      tv: [] as ExternalSearchResult[],
+      games: [] as ExternalSearchResult[],
+      music: [] as ExternalSearchResult[]
+    };
+
+    const remainingLimit = limit - localResults.totalResults;
+    const perTypeLimit = Math.max(5, Math.floor(remainingLimit / 3));
+
+    try {
+      // Search movies with year filters
+      if ((type === "all" || type === "movies") && localResults.movies.length < perTypeLimit) {
+        console.log("🔍 Advanced search TMDB movies:", query, { yearStart, yearEnd });
+        const tmdbMovies = await ctx.runAction(api.media.tmdb.searchMovies, { 
+          query, 
+          page: 1 
+        });
+        
+        let filteredMovies = tmdbMovies;
+        if (yearStart || yearEnd) {
+          filteredMovies = tmdbMovies.filter(movie => {
+            if (yearStart && movie.releaseYear < yearStart) return false;
+            if (yearEnd && movie.releaseYear > yearEnd) return false;
+            return true;
+          });
+        }
+        
+        externalResults.movies = filteredMovies.slice(0, perTypeLimit).map(movie => ({
+          _id: movie.externalId,
+          externalId: movie.externalId,
+          title: movie.title,
+          releaseYear: movie.releaseYear,
+          posterUrl: movie.posterUrl,
+          description: movie.description,
+          type: "movie" as const
+        }));
+      }
+
+      // Search TV shows with year filters
+      if ((type === "all" || type === "tv") && localResults.tv.length < perTypeLimit) {
+        console.log("🔍 Advanced search TMDB TV:", query, { yearStart, yearEnd });
+        const tmdbTV = await ctx.runAction(api.media.tmdb.searchTVShows, { 
+          query, 
+          page: 1 
+        });
+        
+        let filteredTV = tmdbTV;
+        if (yearStart || yearEnd) {
+          filteredTV = tmdbTV.filter(show => {
+            if (yearStart && show.releaseYear < yearStart) return false;
+            if (yearEnd && show.releaseYear > yearEnd) return false;
+            return true;
+          });
+        }
+        
+        externalResults.tv = filteredTV.slice(0, perTypeLimit).map(show => ({
+          _id: show.externalId,
+          externalId: show.externalId,
+          title: show.title,
+          releaseYear: show.releaseYear,
+          posterUrl: show.posterUrl,
+          description: show.description,
+          season: show.season,
+          type: "tv" as const
+        }));
+      }
+
+      // Search games with filters
+      if ((type === "all" || type === "games") && localResults.games.length < perTypeLimit) {
+        console.log("🔍 Advanced search RAWG games:", query, { yearStart, yearEnd });
+        const rawgGames = await ctx.runAction(api.media.rawg.searchGames, { 
+          query, 
+          pageSize: perTypeLimit * 2 // Get more to filter
+        });
+        
+        let filteredGames = rawgGames;
+        if (yearStart || yearEnd) {
+          filteredGames = rawgGames.filter(game => {
+            if (yearStart && game.releaseYear < yearStart) return false;
+            if (yearEnd && game.releaseYear > yearEnd) return false;
+            return true;
+          });
+        }
+        
+        externalResults.games = filteredGames.slice(0, perTypeLimit).map(game => ({
+          _id: game.externalId,
+          externalId: game.externalId,
+          title: game.title,
+          releaseYear: game.releaseYear,
+          posterUrl: game.posterUrl,
+          description: game.description,
+          type: "game" as const
+        }));
+      }
+
+      // Search music with filters
+      if ((type === "all" || type === "music") && localResults.music.length < perTypeLimit) {
+        console.log("🔍 Advanced search Spotify music:", query, { yearStart, yearEnd });
+        const spotifyMusic = await ctx.runAction(api.media.spotify.searchMusic, { 
+          query, 
+          limit: perTypeLimit * 2
+        });
+        
+        let filteredMusic = spotifyMusic;
+        if (yearStart || yearEnd) {
+          filteredMusic = spotifyMusic.filter(track => {
+            if (yearStart && track.releaseYear < yearStart) return false;
+            if (yearEnd && track.releaseYear > yearEnd) return false;
+            return true;
+          });
+        }
+        
+        externalResults.music = filteredMusic.slice(0, perTypeLimit).map(track => ({
+          _id: track.externalId,
+          externalId: track.externalId,
+          title: track.title,
+          releaseYear: track.releaseYear,
+          posterUrl: track.posterUrl,
+          description: track.description,
+          artist: track.artist,
+          type: "music" as const
+        }));
+      }
+
+    } catch (error) {
+      console.error("🔍 Advanced search external API error:", error);
+    }
+
+    // Apply sorting to external results
+    const sortExternalResults = (items: ExternalSearchResult[]) => {
+      const sortedItems = [...items];
+      
+      switch (sortBy) {
+        case "year_desc":
+          return sortedItems.sort((a, b) => b.releaseYear - a.releaseYear);
+        case "year_asc":
+          return sortedItems.sort((a, b) => a.releaseYear - b.releaseYear);
+        case "popularity":
+        case "rating":
+        case "relevance":
+        default:
+          return sortedItems; // Keep API order (usually by relevance)
+      }
+    };
+
+    externalResults.movies = sortExternalResults(externalResults.movies);
+    externalResults.tv = sortExternalResults(externalResults.tv);
+    externalResults.games = sortExternalResults(externalResults.games);
+    externalResults.music = sortExternalResults(externalResults.music);
+
+    // Merge results
+    const mergedResults: SearchResults = {
+      users: localResults.users,
+      movies: mergeResults(localResults.movies, externalResults.movies, Math.floor(limit * 0.25)),
+      tv: mergeResults(localResults.tv, externalResults.tv, Math.floor(limit * 0.25)),
+      games: mergeResults(localResults.games, externalResults.games, Math.floor(limit * 0.25)),
+      music: mergeResults(localResults.music, externalResults.music, Math.floor(limit * 0.25)),
+      totalResults: 0
+    };
+
+    // Trim to requested limit and recalculate total
+    const trimToLimit = (items: LocalSearchResult[], maxItems: number) => items.slice(0, maxItems);
+    
+    const itemsPerType = Math.floor(limit / 4); // Distribute evenly across types
+    
+    mergedResults.movies = trimToLimit(mergedResults.movies, itemsPerType);
+    mergedResults.tv = trimToLimit(mergedResults.tv, itemsPerType);
+    mergedResults.games = trimToLimit(mergedResults.games, itemsPerType);
+    mergedResults.music = trimToLimit(mergedResults.music, itemsPerType);
+
+    mergedResults.totalResults = Object.values(mergedResults)
+      .filter((arr): arr is LocalSearchResult[] => Array.isArray(arr))
+      .reduce((total, arr) => total + arr.length, 0);
+
+    return {
+      ...mergedResults,
+      isFromCache: false
+    };
   }
 });

@@ -16,6 +16,19 @@ export const trackSearch = internalMutation({
     // You could create a searches table to track analytics
     // For now, just log it
     console.log(`🔍 Search: "${args.query}" by user ${args.userId}, ${args.resultCount} results`);
+    
+    // Optional: Insert into a search_analytics table if you create one
+    /*
+    await ctx.db.insert("search_analytics", {
+      query: args.query,
+      userId: args.userId,
+      resultCount: args.resultCount,
+      searchType: args.searchType || "all",
+      timestamp: Date.now()
+    });
+    */
+    
+    return { tracked: true };
   }
 });
 
@@ -32,7 +45,7 @@ export const getPopularSearches = internalQuery({
       .withIndex("by_visibility", (q) => q.eq("visibility", "public"))
       .order("desc")
       .take(50);
-
+      
     const mediaIds = [...new Set(recentLogs.map(log => log.mediaId))];
     const popularMedia = await Promise.all(
       mediaIds.slice(0, args.limit || 10).map(async (mediaId) => {
@@ -40,7 +53,7 @@ export const getPopularSearches = internalQuery({
         return media?.title;
       })
     );
-
+    
     return popularMedia.filter(Boolean);
   }
 });
