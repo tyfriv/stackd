@@ -16,6 +16,12 @@ import type {
 import type * as comments from "../comments.js";
 import type * as feeds_feedGeneration from "../feeds/feedGeneration.js";
 import type * as feeds_feedHelpers from "../feeds/feedHelpers.js";
+import type * as forum_activity from "../forum/activity.js";
+import type * as forum_categories from "../forum/categories.js";
+import type * as forum_index from "../forum/index.js";
+import type * as forum_replies from "../forum/replies.js";
+import type * as forum_search from "../forum/search.js";
+import type * as forum_threads from "../forum/threads.js";
 import type * as lib_apiHelpers from "../lib/apiHelpers.js";
 import type * as lib_constants from "../lib/constants.js";
 import type * as lib_errors from "../lib/errors.js";
@@ -54,6 +60,12 @@ declare const fullApi: ApiFromModules<{
   comments: typeof comments;
   "feeds/feedGeneration": typeof feeds_feedGeneration;
   "feeds/feedHelpers": typeof feeds_feedHelpers;
+  "forum/activity": typeof forum_activity;
+  "forum/categories": typeof forum_categories;
+  "forum/index": typeof forum_index;
+  "forum/replies": typeof forum_replies;
+  "forum/search": typeof forum_search;
+  "forum/threads": typeof forum_threads;
   "lib/apiHelpers": typeof lib_apiHelpers;
   "lib/constants": typeof lib_constants;
   "lib/errors": typeof lib_errors;

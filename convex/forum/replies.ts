@@ -110,6 +110,36 @@ export const getRepliesByThread = query({
     })),
   },
   handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    let currentUser: any = null;
+    let blockedUserIds = new Set<Id<"users">>();
+    let blockedByUserIds = new Set<Id<"users">>();
+
+    // Get current user and blocking relationships upfront
+    if (identity) {
+      currentUser = await ctx.db
+        .query("users")
+        .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
+        .unique();
+
+      if (currentUser) {
+        // Get all users blocked by current user
+        const blockedByMe = await ctx.db
+          .query("blocks")
+          .withIndex("by_blocker", (q) => q.eq("blockerId", currentUser._id))
+          .collect();
+        
+        // Get all users who blocked current user  
+        const blockedMe = await ctx.db
+          .query("blocks")
+          .withIndex("by_blocked", (q) => q.eq("blockedId", currentUser._id))
+          .collect();
+
+        blockedUserIds = new Set(blockedByMe.map(block => block.blockedId));
+        blockedByUserIds = new Set(blockedMe.map(block => block.blockerId));
+      }
+    }
+
     // Validate pagination options
     let paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
     
@@ -126,10 +156,16 @@ export const getRepliesByThread = query({
       .order("asc") // Chronological order for replies
       .paginate(paginationOpts);
 
-    // Enrich with user details and quoted reply info
-    const enrichedReplies = await Promise.all(
+    // Filter out replies from blocked users and enrich with user details
+    const filteredAndEnrichedReplies = await Promise.all(
       replies.page.map(async (reply) => {
         const author = await ctx.db.get(reply.userId);
+        if (!author) return null;
+
+        // Check if this user should be filtered out
+        if (currentUser && (blockedUserIds.has(author._id) || blockedByUserIds.has(author._id))) {
+          return null;
+        }
         
         // Get quoted reply details if this reply quotes another
         let quotedReplyDetails = null;
@@ -137,10 +173,13 @@ export const getRepliesByThread = query({
           const quotedReply = await ctx.db.get(reply.quotedReplyId);
           if (quotedReply) {
             const quotedAuthor = await ctx.db.get(quotedReply.userId);
-            quotedReplyDetails = {
-              ...quotedReply,
-              author: quotedAuthor,
-            };
+            // Only include quoted reply if the quoted author isn't blocked
+            if (quotedAuthor && (!currentUser || (!blockedUserIds.has(quotedAuthor._id) && !blockedByUserIds.has(quotedAuthor._id)))) {
+              quotedReplyDetails = {
+                ...quotedReply,
+                author: quotedAuthor,
+              };
+            }
           }
         }
 
@@ -152,9 +191,12 @@ export const getRepliesByThread = query({
       })
     );
 
+    // Filter out null entries and update pagination
+    const validReplies = filteredAndEnrichedReplies.filter(reply => reply !== null);
+    
     return {
       ...replies,
-      page: enrichedReplies,
+      page: validReplies,
     };
   },
 });
@@ -315,6 +357,35 @@ export const searchRepliesInThread = query({
       return [];
     }
 
+    const identity = await ctx.auth.getUserIdentity();
+    let currentUser: any = null;
+    let blockedUserIds = new Set<Id<"users">>();
+    let blockedByUserIds = new Set<Id<"users">>();
+
+    // Get blocking relationships if user is authenticated
+    if (identity) {
+      currentUser = await ctx.db
+        .query("users")
+        .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
+        .unique();
+
+      if (currentUser) {
+        const [blockedByMe, blockedMe] = await Promise.all([
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocker", (q) => q.eq("blockerId", currentUser._id))
+            .collect(),
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocked", (q) => q.eq("blockedId", currentUser._id))
+            .collect()
+        ]);
+
+        blockedUserIds = new Set(blockedByMe.map(block => block.blockedId));
+        blockedByUserIds = new Set(blockedMe.map(block => block.blockerId));
+      }
+    }
+
     let limit = args.limit || 20;
     if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
       limit = 20;
@@ -326,12 +397,18 @@ export const searchRepliesInThread = query({
       .query("forumReplies")
       .withSearchIndex("search_content", (q) => q.search("content", args.searchTerm.trim()))
       .filter((q) => q.eq(q.field("threadId"), args.threadId))
-      .take(limit);
+      .take(limit * 2); // Get more to account for filtering
 
-    // Enrich with author details
+    // Filter and enrich with author details
     const enrichedResults = await Promise.all(
       searchResults.map(async (reply) => {
         const author = await ctx.db.get(reply.userId);
+        if (!author) return null;
+
+        // Filter blocked users
+        if (currentUser && (blockedUserIds.has(author._id) || blockedByUserIds.has(author._id))) {
+          return null;
+        }
         
         // Get quoted reply if exists
         let quotedReplyDetails = null;
@@ -339,10 +416,12 @@ export const searchRepliesInThread = query({
           const quotedReply = await ctx.db.get(reply.quotedReplyId);
           if (quotedReply) {
             const quotedAuthor = await ctx.db.get(quotedReply.userId);
-            quotedReplyDetails = {
-              ...quotedReply,
-              author: quotedAuthor,
-            };
+            if (quotedAuthor && (!currentUser || (!blockedUserIds.has(quotedAuthor._id) && !blockedByUserIds.has(quotedAuthor._id)))) {
+              quotedReplyDetails = {
+                ...quotedReply,
+                author: quotedAuthor,
+              };
+            }
           }
         }
 
@@ -354,7 +433,7 @@ export const searchRepliesInThread = query({
       })
     );
 
-    return enrichedResults;
+    return enrichedResults.filter(result => result !== null).slice(0, limit);
   },
 });
 
@@ -365,6 +444,35 @@ export const getRecentReplies = query({
     excludeThreadIds: v.optional(v.array(v.id("forumThreads"))),
   },
   handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    let currentUser: any = null;
+    let blockedUserIds = new Set<Id<"users">>();
+    let blockedByUserIds = new Set<Id<"users">>();
+
+    // Get blocking relationships if user is authenticated
+    if (identity) {
+      currentUser = await ctx.db
+        .query("users")
+        .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
+        .unique();
+
+      if (currentUser) {
+        const [blockedByMe, blockedMe] = await Promise.all([
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocker", (q) => q.eq("blockerId", currentUser._id))
+            .collect(),
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocked", (q) => q.eq("blockedId", currentUser._id))
+            .collect()
+        ]);
+
+        blockedUserIds = new Set(blockedByMe.map(block => block.blockedId));
+        blockedByUserIds = new Set(blockedMe.map(block => block.blockerId));
+      }
+    }
+
     let limit = args.limit || 15;
     if (typeof limit !== 'number' || isNaN(limit) || !isFinite(limit)) {
       limit = 15;
@@ -375,7 +483,7 @@ export const getRecentReplies = query({
     let replies = await ctx.db
       .query("forumReplies")
       .order("desc")
-      .take(limit * 2); // Get more to filter if needed
+      .take(limit * 3); // Get more to account for filtering
 
     // Filter out excluded threads
     if (args.excludeThreadIds && args.excludeThreadIds.length > 0) {
@@ -383,15 +491,21 @@ export const getRecentReplies = query({
       replies = replies.filter(reply => !excludeSet.has(reply.threadId));
     }
 
-    replies = replies.slice(0, limit);
-
-    // Enrich with details
+    // Enrich with details and filter blocked users
     const enrichedReplies = await Promise.all(
       replies.map(async (reply) => {
         const author = await ctx.db.get(reply.userId);
+        if (!author) return null;
+
+        // Filter blocked users
+        if (currentUser && (blockedUserIds.has(author._id) || blockedByUserIds.has(author._id))) {
+          return null;
+        }
+
         const thread = await ctx.db.get(reply.threadId);
-        let category = null;
+        if (!thread) return null;
         
+        let category = null;
         if (thread) {
           category = await ctx.db.get(thread.categoryId);
         }
@@ -402,10 +516,12 @@ export const getRecentReplies = query({
           const quotedReply = await ctx.db.get(reply.quotedReplyId);
           if (quotedReply) {
             const quotedAuthor = await ctx.db.get(quotedReply.userId);
-            quotedReplyDetails = {
-              ...quotedReply,
-              author: quotedAuthor,
-            };
+            if (quotedAuthor && (!currentUser || (!blockedUserIds.has(quotedAuthor._id) && !blockedByUserIds.has(quotedAuthor._id)))) {
+              quotedReplyDetails = {
+                ...quotedReply,
+                author: quotedAuthor,
+              };
+            }
           }
         }
 
@@ -419,8 +535,10 @@ export const getRecentReplies = query({
       })
     );
 
-    // Filter out replies where thread/category couldn't be loaded
-    return enrichedReplies.filter(reply => reply.thread && reply.category);
+    // Filter out replies where thread/category couldn't be loaded or user is blocked
+    return enrichedReplies
+      .filter(reply => reply !== null && reply.thread && reply.category)
+      .slice(0, limit);
   },
 });
 
@@ -444,6 +562,44 @@ export const getRepliesByUser = query({
     })),
   },
   handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    let currentUser: any = null;
+    let blockedUserIds = new Set<Id<"users">>();
+    let blockedByUserIds = new Set<Id<"users">>();
+
+    // Get blocking relationships if user is authenticated
+    if (identity) {
+      currentUser = await ctx.db
+        .query("users")
+        .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
+        .unique();
+
+      if (currentUser) {
+        const [blockedByMe, blockedMe] = await Promise.all([
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocker", (q) => q.eq("blockerId", currentUser._id))
+            .collect(),
+          ctx.db
+            .query("blocks")
+            .withIndex("by_blocked", (q) => q.eq("blockedId", currentUser._id))
+            .collect()
+        ]);
+
+        blockedUserIds = new Set(blockedByMe.map(block => block.blockedId));
+        blockedByUserIds = new Set(blockedMe.map(block => block.blockerId));
+      }
+    }
+
+    // Check if the target user should be filtered
+    if (currentUser && (blockedUserIds.has(args.userId) || blockedByUserIds.has(args.userId))) {
+      return {
+        page: [],
+        isDone: true,
+        continueCursor: null,
+      };
+    }
+
     // Validate pagination options
     let paginationOpts = args.paginationOpts || { numItems: 20, cursor: null };
     
@@ -476,10 +632,12 @@ export const getRepliesByUser = query({
           const quotedReply = await ctx.db.get(reply.quotedReplyId);
           if (quotedReply) {
             const quotedAuthor = await ctx.db.get(quotedReply.userId);
-            quotedReplyDetails = {
-              ...quotedReply,
-              author: quotedAuthor,
-            };
+            if (quotedAuthor && (!currentUser || (!blockedUserIds.has(quotedAuthor._id) && !blockedByUserIds.has(quotedAuthor._id)))) {
+              quotedReplyDetails = {
+                ...quotedReply,
+                author: quotedAuthor,
+              };
+            }
           }
         }
 

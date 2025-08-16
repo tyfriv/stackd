@@ -10,8 +10,8 @@ export * from "./threads";
 // Replies
 export * from "./replies";
 
-// Search
-export * from "./search";
+// Search (temporarily disabled)
+// export * from "./search";
 
 // Activity
 export * from "./activity";
