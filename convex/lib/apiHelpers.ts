@@ -104,27 +104,8 @@ export async function handleAPIResponse(response: Response, apiSource: string): 
   }
 }
 
-// Rate limiting helper (simple in-memory)
-const rateLimits = new Map<string, { count: number; resetTime: number }>();
-
-export function checkRateLimit(apiSource: string, maxRequests: number = 100, windowMs: number = 60000): boolean {
-  const now = Date.now();
-  const key = `${apiSource}`;
-  const current = rateLimits.get(key);
-  
-  if (!current || now > current.resetTime) {
-    // Reset window
-    rateLimits.set(key, { count: 1, resetTime: now + windowMs });
-    return true;
-  }
-  
-  if (current.count >= maxRequests) {
-    return false; // Rate limited
-  }
-  
-  current.count++;
-  return true;
-}
+// Rate limiting is now handled by the database-backed system in rateLimits.ts
+// Use ctx.runMutation(internal.rateLimits.checkRateLimit) in actions
 
 // Convert media doc to search result format
 export function mediaDocToSearchResult(media: Doc<"media">): MediaSearchResult {

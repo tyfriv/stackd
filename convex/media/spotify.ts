@@ -2,7 +2,7 @@
 import { action } from "../_generated/server";
 import { v } from "convex/values";
 import { internal, api } from "../_generated/api";
-import { APIError, extractYear, cleanDescription, standardizePosterUrl, checkRateLimit } from "../lib/apiHelpers";
+import { APIError, extractYear, cleanDescription, standardizePosterUrl } from "../lib/apiHelpers";
 import type { MediaSearchResult } from "../lib/apiHelpers";
 
 // Spotify API configuration
@@ -238,7 +238,16 @@ export const searchMusic = action({
     }
 
     // Rate limiting check - Spotify allows more requests than RAWG
-    if (!checkRateLimit("spotify", 100, 60000)) { // 100 requests per minute
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `spotify_${identity.subject}` : 'spotify_anonymous';
+    
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 100, // 100 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
       throw new APIError("Spotify API rate limit exceeded", "spotify", 429);
     }
 
@@ -373,7 +382,16 @@ export const searchAlbums = action({
     }
 
     // Rate limiting check
-    if (!checkRateLimit("spotify", 100, 60000)) {
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `spotify_${identity.subject}` : 'spotify_anonymous';
+    
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 100, // 100 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
       throw new APIError("Spotify API rate limit exceeded", "spotify", 429);
     }
 
@@ -473,7 +491,16 @@ export const getTrackDetails = action({
     const { trackId } = args;
 
     // Rate limiting check
-    if (!checkRateLimit("spotify", 100, 60000)) {
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `spotify_${identity.subject}` : 'spotify_anonymous';
+    
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 100, // 100 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
       throw new APIError("Spotify API rate limit exceeded", "spotify", 429);
     }
 
@@ -584,7 +611,16 @@ export const getAlbumDetails = action({
     const { albumId } = args;
 
     // Rate limiting check
-    if (!checkRateLimit("spotify", 100, 60000)) {
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `spotify_${identity.subject}` : 'spotify_anonymous';
+    
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 100, // 100 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
       throw new APIError("Spotify API rate limit exceeded", "spotify", 429);
     }
 

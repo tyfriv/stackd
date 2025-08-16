@@ -7,8 +7,7 @@ import {
   handleAPIResponse, 
   standardizePosterUrl, 
   extractYear, 
-  cleanDescription,
-  checkRateLimit 
+  cleanDescription
 } from "../lib/apiHelpers";
 
 // TMDB API configuration
@@ -43,6 +42,27 @@ interface TMDBSearchResponse {
   total_pages: number;
 }
 
+// Helper function to make secure API calls
+async function makeSecureTMDBRequest(endpoint: string, params: Record<string, string> = {}): Promise<Response> {
+  if (!TMDB_API_KEY) {
+    throw new APIError("TMDB API key not configured", "tmdb");
+  }
+
+  const url = new URL(endpoint, TMDB_BASE_URL);
+  Object.entries(params).forEach(([key, value]) => {
+    url.searchParams.append(key, value);
+  });
+
+  return await fetch(url.toString(), {
+    headers: {
+      'Authorization': `Bearer ${TMDB_API_KEY}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json'
+    },
+    method: 'GET'
+  });
+}
+
 // Search movies via TMDB API
 export const searchMovies = action({
   args: { query: v.string(), page: v.optional(v.number()) },
@@ -51,16 +71,29 @@ export const searchMovies = action({
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Rate limiting check
-    if (!checkRateLimit("tmdb", 40, 60000)) { // 40 requests per minute
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb");
+    // Get current user for rate limiting
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
+
+    // Check rate limiting with database-backed implementation
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 30, // 30 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
+      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
     }
 
     const page = args.page || 1;
-    const url = `${TMDB_BASE_URL}/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(args.query)}&page=${page}`;
-
+    
     try {
-      const response = await fetch(url);
+      const response = await makeSecureTMDBRequest('/search/movie', {
+        query: encodeURIComponent(args.query.trim()),
+        page: page.toString()
+      });
+
       const data: TMDBSearchResponse = await handleAPIResponse(response, "tmdb");
 
       const results: MediaSearchResult[] = [];
@@ -94,7 +127,7 @@ export const searchMovies = action({
             description: cleanDescription(movieResult.overview),
           };
 
-          // Cache the result
+          // Cache the result - store minimal data instead of full rawData
           await ctx.runMutation(internal.media.mediaQueries.cacheMediaItem, {
             externalId: mediaResult.externalId,
             type: mediaResult.type,
@@ -102,7 +135,12 @@ export const searchMovies = action({
             releaseYear: mediaResult.releaseYear,
             posterUrl: mediaResult.posterUrl,
             description: mediaResult.description,
-            rawData: movieResult, // Store full TMDB response for future use
+            rawData: {
+              id: movieResult.id,
+              title: movieResult.title,
+              release_date: movieResult.release_date,
+              poster_path: movieResult.poster_path
+            }, // Store only essential fields
           });
 
           results.push(mediaResult);
@@ -133,16 +171,29 @@ export const searchTVShows = action({
       throw new APIError("TMDB API key not configured", "tmdb");
     }
 
-    // Rate limiting check
-    if (!checkRateLimit("tmdb", 40, 60000)) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb");
+    // Get current user for rate limiting
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
+
+    // Check rate limiting with database-backed implementation
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 30, // 30 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
+      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
     }
 
     const page = args.page || 1;
-    const url = `${TMDB_BASE_URL}/search/tv?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(args.query)}&page=${page}`;
-
+    
     try {
-      const response = await fetch(url);
+      const response = await makeSecureTMDBRequest('/search/tv', {
+        query: encodeURIComponent(args.query.trim()),
+        page: page.toString()
+      });
+
       const data: TMDBSearchResponse = await handleAPIResponse(response, "tmdb");
 
       const results: MediaSearchResult[] = [];
@@ -175,8 +226,7 @@ export const searchTVShows = action({
             releaseYear: extractYear(tvResult.first_air_date),
             posterUrl: standardizePosterUrl(tvResult.poster_path, "tmdb"),
             description: cleanDescription(tvResult.overview),
-            // Default to season 1 for new TV shows
-            season: 1,
+            season: 1, // Default to season 1 for new TV shows
           };
 
           // Cache the result
@@ -188,7 +238,12 @@ export const searchTVShows = action({
             posterUrl: mediaResult.posterUrl,
             description: mediaResult.description,
             season: mediaResult.season,
-            rawData: tvResult, // Store full TMDB response
+            rawData: {
+              id: tvResult.id,
+              name: tvResult.name,
+              first_air_date: tvResult.first_air_date,
+              poster_path: tvResult.poster_path
+            }, // Store minimal data
           });
 
           results.push(mediaResult);
@@ -229,15 +284,23 @@ export const getMovieDetails = action({
       return cached;
     }
 
-    // Rate limiting check
-    if (!checkRateLimit("tmdb", 40, 60000)) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb");
+    // Get current user for rate limiting
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
+
+    // Check rate limiting with database-backed implementation
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 30, // 30 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
+      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
     }
 
-    const url = `${TMDB_BASE_URL}/movie/${args.movieId}?api_key=${TMDB_API_KEY}`;
-
     try {
-      const response = await fetch(url);
+      const response = await makeSecureTMDBRequest(`/movie/${args.movieId}`);
       const movie: TMDBMovieResult = await handleAPIResponse(response, "tmdb");
 
       // Cache and return detailed info
@@ -248,7 +311,12 @@ export const getMovieDetails = action({
         releaseYear: extractYear(movie.release_date),
         posterUrl: standardizePosterUrl(movie.poster_path, "tmdb"),
         description: cleanDescription(movie.overview),
-        rawData: movie,
+        rawData: {
+          id: movie.id,
+          title: movie.title,
+          release_date: movie.release_date,
+          poster_path: movie.poster_path
+        },
       });
 
       return await ctx.runQuery(internal.media.mediaQueries.getMediaById, { mediaId });
@@ -285,15 +353,23 @@ export const getTVDetails = action({
       return cached;
     }
 
-    // Rate limiting check
-    if (!checkRateLimit("tmdb", 40, 60000)) {
-      throw new APIError("Rate limit exceeded for TMDB API", "tmdb");
+    // Get current user for rate limiting
+    const identity = await ctx.auth.getUserIdentity();
+    const userRateLimitKey = identity ? `tmdb_${identity.subject}` : 'tmdb_anonymous';
+
+    // Check rate limiting with database-backed implementation
+    const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+      key: userRateLimitKey,
+      limit: 30, // 30 requests per hour per user
+      windowMs: 60 * 60 * 1000 // 1 hour
+    });
+
+    if (!rateLimitAllowed) {
+      throw new APIError("Rate limit exceeded for TMDB API", "tmdb", 429);
     }
 
-    const url = `${TMDB_BASE_URL}/tv/${args.tvId}?api_key=${TMDB_API_KEY}`;
-
     try {
-      const response = await fetch(url);
+      const response = await makeSecureTMDBRequest(`/tv/${args.tvId}`);
       const show: TMDBTVResult = await handleAPIResponse(response, "tmdb");
 
       // Cache and return detailed info
@@ -305,7 +381,12 @@ export const getTVDetails = action({
         posterUrl: standardizePosterUrl(show.poster_path, "tmdb"),
         description: cleanDescription(show.overview),
         season: 1,
-        rawData: show,
+        rawData: {
+          id: show.id,
+          name: show.name,
+          first_air_date: show.first_air_date,
+          poster_path: show.poster_path
+        },
       });
 
       return await ctx.runQuery(internal.media.mediaQueries.getMediaById, { mediaId });

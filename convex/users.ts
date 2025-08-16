@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { sanitizeUsername, validateUsername } from "./lib/validation";
 
 // Get current authenticated user (read only)
 export const getCurrentUser = query({
@@ -37,16 +38,23 @@ export const createUserIfNotExists = mutation({
       return existingUser._id;
     }
 
-    // Safe username generation
+    // Safe username generation with proper validation
     const generateUsername = (): string => {
+      let proposedUsername = '';
+      
       if (identity.username && typeof identity.username === 'string') {
-        return identity.username.trim();
-      }
-      if (identity.email && typeof identity.email === 'string') {
+        proposedUsername = sanitizeUsername(identity.username);
+      } else if (identity.email && typeof identity.email === 'string') {
         const emailPrefix = identity.email.split('@')[0];
-        return emailPrefix.replace(/[^a-zA-Z0-9_]/g, ''); // Clean special chars
+        proposedUsername = sanitizeUsername(emailPrefix);
       }
-      return `user_${Date.now()}`;
+      
+      // Ensure username meets validation requirements
+      if (!validateUsername(proposedUsername)) {
+        proposedUsername = `user_${Date.now()}`;
+      }
+      
+      return proposedUsername;
     };
 
     // Create new user with validated data

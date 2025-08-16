@@ -162,4 +162,12 @@ export default defineSchema({
     .index("by_user", ["userId"])
     .index("by_user_unread", ["userId", "isRead"])
     .index("by_user_created", ["userId", "createdAt"]), // For chronological ordering
+
+  // Rate limiting tracking
+  rateLimits: defineTable({
+    key: v.string(),
+    timestamp: v.number(),
+  })
+    .index("by_key", ["key"])
+    .index("by_timestamp", ["timestamp"]),
 });

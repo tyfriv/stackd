@@ -1,0 +1,18 @@
+// convex/lib/constants.ts
+export const LIMITS = {
+  REVIEW_MAX_LENGTH: 5000,
+  USERNAME_MAX_LENGTH: 30,
+  BIO_MAX_LENGTH: 500,
+  RATING_MAX: 10,
+  PAGINATION_DEFAULT: 20,
+  PAGINATION_MAX: 50,
+} as const;
+
+export const RATE_LIMITS = {
+  API_PER_USER_PER_HOUR: 30, // Corrected: was per minute, now per hour
+  API_GLOBAL_PER_MINUTE: 100,
+  LOGIN_ATTEMPTS_PER_HOUR: 5,
+  TMDB_PER_USER_PER_HOUR: 30,
+  SPOTIFY_PER_USER_PER_HOUR: 100,
+  RAWG_PER_USER_PER_HOUR: 22,
+} as const;

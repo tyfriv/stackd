@@ -6,11 +6,19 @@ import { APIError, extractYear, cleanDescription, standardizePosterUrl } from ".
 import type { MediaSearchResult } from "../lib/apiHelpers";
 
 // RAWG API rate limit: 20,000 requests per month (~22 per hour to be safe)
-// Simple rate limiting check
 async function checkRAWGRateLimit(ctx: any): Promise<void> {
-  // For now, just a simple check - you can enhance this later
-  // The actual rate limiting logic would go here
-  return;
+  const identity = await ctx.auth.getUserIdentity();
+  const userRateLimitKey = identity ? `rawg_${identity.subject}` : 'rawg_anonymous';
+  
+  const rateLimitAllowed = await ctx.runMutation(internal.rateLimits.checkRateLimit, {
+    key: userRateLimitKey,
+    limit: 22, // 22 requests per hour per user (safe for monthly limit)
+    windowMs: 60 * 60 * 1000 // 1 hour
+  });
+
+  if (!rateLimitAllowed) {
+    throw new APIError("RAWG API rate limit exceeded", "rawg", 429);
+  }
 }
 
 interface RAWGGame {
