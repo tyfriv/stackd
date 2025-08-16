@@ -86,7 +86,7 @@ export const getUserByUsername = query({
   },
 });
 
-// Update user profile
+// Update user profile (bio and profile image only - showcases handled separately)
 export const updateProfile = mutation({
   args: {
     bio: v.optional(v.string()),
@@ -116,40 +116,6 @@ export const updateProfile = mutation({
   },
 });
 
-// Update Top 4 showcases
-export const updateTopShowcases = mutation({
-  args: {
-    topMovies: v.optional(v.array(v.string())),
-    topTvShows: v.optional(v.array(v.string())),
-    topGames: v.optional(v.array(v.string())),
-    topMusic: v.optional(v.array(v.string())),
-  },
-  handler: async (ctx, args) => {
-    const identity = await ctx.auth.getUserIdentity();
-    if (!identity) {
-      throw new Error("Not authenticated");
-    }
-
-    const user = await ctx.db
-      .query("users")
-      .withIndex("by_clerk_id", (q) => q.eq("clerkId", identity.subject))
-      .unique();
-
-    if (!user) {
-      throw new Error("User not found");
-    }
-
-    const updates: any = {};
-    if (args.topMovies !== undefined) updates.topMovies = args.topMovies.slice(0, 4);
-    if (args.topTvShows !== undefined) updates.topTvShows = args.topTvShows.slice(0, 4);
-    if (args.topGames !== undefined) updates.topGames = args.topGames.slice(0, 4);
-    if (args.topMusic !== undefined) updates.topMusic = args.topMusic.slice(0, 4);
-
-    await ctx.db.patch(user._id, updates);
-    return user._id;
-  },
-});
-
 // Check if username is available
 export const checkUsernameAvailable = query({
   args: { username: v.string() },
@@ -162,3 +128,11 @@ export const checkUsernameAvailable = query({
     return existingUser === null;
   },
 });
+
+// Note: updateTopShowcases has been removed - use the dedicated showcase operations instead:
+// - addToShowcase
+// - removeFromShowcase 
+// - reorderShowcase
+// - replaceShowcase
+// - batchUpdateShowcases
+// Import these from convex/showcases/index.ts
