@@ -159,6 +159,7 @@ export const updateLog = mutation({
 });
 
 /**
+/**
  * Delete a media log
  */
 export const deleteLog = mutation({
@@ -212,6 +213,37 @@ export const deleteLog = mutation({
 
     for (const reaction of reactions) {
       await ctx.db.delete(reaction._id);
+    }
+
+    // Delete associated notifications (cleanup orphaned notifications)
+    const notifications = await ctx.db
+      .query("notifications")
+      .withIndex("by_user", (q) => q.eq("userId", user._id))
+      .filter((q) => 
+        q.and(
+          q.eq(q.field("targetType"), "log"),
+          q.eq(q.field("targetId"), args.logId)
+        )
+      )
+      .collect();
+
+    for (const notification of notifications) {
+      await ctx.db.delete(notification._id);
+    }
+
+    // Also delete notifications where this user was the sender (reactions/comments on this log)
+    const senderNotifications = await ctx.db
+      .query("notifications")
+      .filter((q) => 
+        q.and(
+          q.eq(q.field("targetType"), "log"),
+          q.eq(q.field("targetId"), args.logId)
+        )
+      )
+      .collect();
+
+    for (const notification of senderNotifications) {
+      await ctx.db.delete(notification._id);
     }
 
     // Delete the log

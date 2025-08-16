@@ -2,6 +2,7 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import { Id } from "./_generated/dataModel";
+import { notifyReaction } from "./lib/notificationHelpers";
 
 // Toggle a reaction (add if not exists, remove if exists, or change type)
 export const toggleReaction = mutation({
@@ -26,20 +27,31 @@ export const toggleReaction = mutation({
       throw new Error("User not found");
     }
 
-    // Validate target exists
+    // Validate target exists and get target owner
     let targetExists = false;
+    let targetOwnerId: Id<"users"> | null = null;
+
     if (args.targetType === "log") {
       const log = await ctx.db.get(args.targetId as Id<"logs">);
-      targetExists = !!log;
+      if (log) {
+        targetExists = true;
+        targetOwnerId = log.userId;
+      }
     } else if (args.targetType === "thread") {
       const thread = await ctx.db.get(args.targetId as Id<"forumThreads">);
-      targetExists = !!thread;
+      if (thread) {
+        targetExists = true;
+        targetOwnerId = thread.userId;
+      }
     } else if (args.targetType === "reply") {
       const reply = await ctx.db.get(args.targetId as Id<"forumReplies">);
-      targetExists = !!reply;
+      if (reply) {
+        targetExists = true;
+        targetOwnerId = reply.userId;
+      }
     }
 
-    if (!targetExists) {
+    if (!targetExists || !targetOwnerId) {
       throw new Error("Target not found");
     }
 
@@ -51,18 +63,23 @@ export const toggleReaction = mutation({
       )
       .unique();
 
+    let shouldCreateNotification = false;
+    let action: string;
+
     if (existingReaction) {
       if (existingReaction.reactionType === args.reactionType) {
         // Remove reaction if it's the same type
         await ctx.db.delete(existingReaction._id);
-        return { action: "removed", reactionType: args.reactionType };
+        action = "removed";
+        // No notification needed for removal
       } else {
         // Update reaction type
         await ctx.db.patch(existingReaction._id, {
           reactionType: args.reactionType,
           createdAt: Date.now(),
         });
-        return { action: "updated", reactionType: args.reactionType };
+        action = "updated";
+        shouldCreateNotification = true;
       }
     } else {
       // Create new reaction
@@ -73,8 +90,16 @@ export const toggleReaction = mutation({
         reactionType: args.reactionType,
         createdAt: Date.now(),
       });
-      return { action: "added", reactionType: args.reactionType };
+      action = "added";
+      shouldCreateNotification = true;
     }
+
+    // Create notification if needed (only for new reactions or reaction changes)
+    if (shouldCreateNotification && targetOwnerId !== user._id) {
+      await notifyReaction(ctx, targetOwnerId, user._id, args.targetType, args.targetId, args.reactionType);
+    }
+
+    return { action, reactionType: args.reactionType };
   },
 });
 

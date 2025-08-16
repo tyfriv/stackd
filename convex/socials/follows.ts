@@ -2,6 +2,7 @@
 import { v } from "convex/values";
 import { mutation, query } from "../_generated/server";
 import { Id } from "../_generated/dataModel";
+import { notifyFollow } from "../lib/notificationHelpers";
 
 // Follow a user
 export const follow = mutation({
@@ -65,19 +66,8 @@ export const follow = mutation({
       createdAt: Date.now(),
     });
 
-    // Create notification for followed user (don't fail if notification fails)
-    try {
-      await ctx.db.insert("notifications", {
-        userId: args.followingId,
-        type: "follow",
-        fromUserId: currentUser._id,
-        isRead: false,
-        createdAt: Date.now(),
-      });
-    } catch (error) {
-      // Log error but don't fail the follow operation
-      console.warn("Failed to create follow notification:", error);
-    }
+    // Create notification using helper
+    await notifyFollow(ctx, args.followingId, currentUser._id);
 
     return followId;
   },

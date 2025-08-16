@@ -1,6 +1,7 @@
 // convex/comments.ts
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { notifyComment } from "./lib/notificationHelpers";
 
 // Create a comment on a review/log
 export const createComment = mutation({
@@ -84,6 +85,11 @@ export const createComment = mutation({
       content: args.content.trim(),
       createdAt: Date.now(),
     });
+
+    // Create notification for log owner (if not commenting on own log)
+    if (log.userId !== user._id) {
+      await notifyComment(ctx, log.userId, user._id, args.logId, args.content.trim());
+    }
 
     return commentId;
   },
